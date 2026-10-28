@@ -1,0 +1,7 @@
+/target/
+*.duckdb
+*.duckdb.wal
+*.log
+.DS_Store
+/PUBLICATION_CHECKLIST.md
+/.tmp/
