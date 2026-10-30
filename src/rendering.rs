@@ -7,6 +7,7 @@ use ratatui::{
 
 use crate::{
     domain::{HydrationState, IssueLevel, IssueStatus, ListViewKind},
+    event::SlimEvent,
     stores::SentryStore,
     theme::theme,
     ui::{
@@ -27,6 +28,8 @@ pub fn render_main_ui(
 ) {
     let area = frame.area();
     let buf = frame.buffer_mut();
+
+    widgets.clear_hitboxes();
 
     Block::default().style(theme().background).render(area, buf);
 
@@ -70,14 +73,15 @@ pub fn render_main_ui(
             widgets.filter_scope.search_query.as_str()
         };
         FilterInputBar::new(val, widgets.filtering).render(f_area, buf);
+        widgets.register_hitbox(f_area, SlimEvent::FilterInputClear);
     }
 
     let focused = widgets.modal.is_none();
 
     if let Some(ref mut detail_state) = widgets.open_issue_detail {
-        IssueDetailView::new(store, detail_state).render(body_area, buf);
+        IssueDetailView::new(store, detail_state, &mut widgets.hitboxes).render(body_area, buf);
     } else {
-        IssuesTableWidget::new(widgets.active_list_view, focused).render(
+        IssuesTableWidget::new(widgets.active_list_view, focused, &mut widgets.hitboxes).render(
             body_area,
             buf,
             &mut widgets.list_state,
@@ -96,13 +100,45 @@ pub fn render_main_ui(
 
     if let Some(ref notice) = widgets.active_notice {
         NotificationBanner::new(notice).render(area, buf);
+        widgets.register_hitbox(
+            NotificationBanner::banner_area(area),
+            SlimEvent::NotificationDismiss,
+        );
     }
+}
+
+fn push_clickable_span<'a>(
+    spans: &mut Vec<Span<'a>>,
+    hitboxes: &mut Vec<(Rect, SlimEvent)>,
+    cur_x: &mut u16,
+    y: u16,
+    max_x: u16,
+    span: Span<'a>,
+    event: Option<SlimEvent>,
+) {
+    let w = span.width() as u16;
+    if let Some(ev) = event {
+        let clamped_w = w.min(max_x.saturating_sub(*cur_x));
+        if clamped_w > 0 {
+            hitboxes.push((
+                Rect {
+                    x: *cur_x,
+                    y,
+                    width: clamped_w,
+                    height: 1,
+                },
+                ev,
+            ));
+        }
+    }
+    *cur_x = cur_x.saturating_add(w);
+    spans.push(span);
 }
 
 fn render_top_chrome(
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
-    widgets: &StatefulWidgets,
+    widgets: &mut StatefulWidgets,
     store: &SentryStore,
     org_slug: &str,
     offline: bool,
@@ -127,8 +163,10 @@ fn render_top_chrome(
     let feed_count = store.activity_events.len();
     let all_count = store.issues.len();
 
+    let in_detail = widgets.is_in_detail_view();
+    let active_list_view = widgets.active_list_view;
     let tab_style = |v: ListViewKind| {
-        if !widgets.is_in_detail_view() && widgets.active_list_view == v {
+        if !in_detail && active_list_view == v {
             theme().active_tab
         } else {
             theme().inactive_tab
@@ -157,50 +195,120 @@ fn render_top_chrome(
         theme().health_ok
     };
 
-    let mut spans = vec![
+    let project_label = widgets.filter_scope.project_scope.label();
+    let sort_label = widgets.filter_scope.sort.label();
+
+    let mut spans = Vec::with_capacity(20);
+    let mut cur_x = area.x;
+    let max_x = area.x.saturating_add(area.width);
+    let y = area.y;
+    let hitboxes = &mut widgets.hitboxes;
+
+    push_clickable_span(
+        &mut spans,
+        hitboxes,
+        &mut cur_x,
+        y,
+        max_x,
         Span::styled(
             format!(" 1: Unresolved ({unresolved_count}) "),
             tab_style(ListViewKind::Unresolved),
         ),
-        Span::raw(" "),
+        Some(SlimEvent::SwitchListView(ListViewKind::Unresolved)),
+    );
+    push_clickable_span(&mut spans, hitboxes, &mut cur_x, y, max_x, Span::raw(" "), None);
+    push_clickable_span(
+        &mut spans,
+        hitboxes,
+        &mut cur_x,
+        y,
+        max_x,
         Span::styled(
             format!(" 2: Unhandled/High ({high_unhandled_count}) "),
             tab_style(ListViewKind::HighUnhandled),
         ),
-        Span::raw(" "),
+        Some(SlimEvent::SwitchListView(ListViewKind::HighUnhandled)),
+    );
+    push_clickable_span(&mut spans, hitboxes, &mut cur_x, y, max_x, Span::raw(" "), None);
+    push_clickable_span(
+        &mut spans,
+        hitboxes,
+        &mut cur_x,
+        y,
+        max_x,
         Span::styled(
             format!(" 3: Incoming Feed ({feed_count}) "),
             tab_style(ListViewKind::IncomingFeed),
         ),
-        Span::raw(" "),
+        Some(SlimEvent::SwitchListView(ListViewKind::IncomingFeed)),
+    );
+    push_clickable_span(&mut spans, hitboxes, &mut cur_x, y, max_x, Span::raw(" "), None);
+    push_clickable_span(
+        &mut spans,
+        hitboxes,
+        &mut cur_x,
+        y,
+        max_x,
         Span::styled(
             format!(" 4: All ({all_count}) "),
             tab_style(ListViewKind::AllIssues),
         ),
-        Span::raw("  "),
+        Some(SlimEvent::SwitchListView(ListViewKind::AllIssues)),
+    );
+    push_clickable_span(&mut spans, hitboxes, &mut cur_x, y, max_x, Span::raw("  "), None);
+    push_clickable_span(
+        &mut spans,
+        hitboxes,
+        &mut cur_x,
+        y,
+        max_x,
         Span::styled(format!("[Org: {org_slug}]"), theme().org_badge),
-        Span::raw(" "),
-        Span::styled(
-            format!("[Project: {}]", widgets.filter_scope.project_scope.label()),
-            theme().scope_pill,
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!("[Sort: {}]", widgets.filter_scope.sort.label()),
-            theme().tag_key,
-        ),
-    ];
+        Some(SlimEvent::ManualRefresh),
+    );
+    push_clickable_span(&mut spans, hitboxes, &mut cur_x, y, max_x, Span::raw(" "), None);
+    push_clickable_span(
+        &mut spans,
+        hitboxes,
+        &mut cur_x,
+        y,
+        max_x,
+        Span::styled(format!("[Project: {project_label}]"), theme().scope_pill),
+        Some(SlimEvent::CycleProjectScope { reverse: false }),
+    );
+    push_clickable_span(&mut spans, hitboxes, &mut cur_x, y, max_x, Span::raw(" "), None);
+    push_clickable_span(
+        &mut spans,
+        hitboxes,
+        &mut cur_x,
+        y,
+        max_x,
+        Span::styled(format!("[Sort: {sort_label}]"), theme().tag_key),
+        Some(SlimEvent::CycleIssueSort),
+    );
 
-    if widgets.is_in_detail_view() {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(" [INSPECTING ISSUE] ", theme().active_tab));
+    if in_detail {
+        push_clickable_span(&mut spans, hitboxes, &mut cur_x, y, max_x, Span::raw(" "), None);
+        push_clickable_span(
+            &mut spans,
+            hitboxes,
+            &mut cur_x,
+            y,
+            max_x,
+            Span::styled(" [INSPECTING ISSUE] ", theme().active_tab),
+            Some(SlimEvent::CloseIssueDetail),
+        );
     }
 
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("({sync_label}{quack_badge})"),
-        health_style,
-    ));
+    push_clickable_span(&mut spans, hitboxes, &mut cur_x, y, max_x, Span::raw("  "), None);
+    push_clickable_span(
+        &mut spans,
+        hitboxes,
+        &mut cur_x,
+        y,
+        max_x,
+        Span::styled(format!("({sync_label}{quack_badge})"), health_style),
+        Some(SlimEvent::ManualRefresh),
+    );
 
     Paragraph::new(Line::from(spans)).render(area, buf);
 }
@@ -310,6 +418,30 @@ mod tests {
             })
             .unwrap();
 
+        // Verify clicking the first issue row dispatches SelectAndOpenIssue
+        let mut click_events = Vec::new();
+        crate::input::process_mouse_event(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 10,
+                row: 3, // header=0, border=1, table header=2, first row=3
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &mut widgets,
+            &mut click_events,
+        );
+        assert_eq!(click_events.len(), 1);
+        match &click_events[0] {
+            SlimEvent::SelectAndOpenIssue {
+                row_index,
+                issue_id: clicked_id,
+            } => {
+                assert_eq!(*row_index, 0);
+                assert_eq!(clicked_id, &issue_id);
+            }
+            other => panic!("unexpected event from row click: {other:?}"),
+        }
+
         // 2. Open issue detail and render all 5 sub-pages
         widgets.open_issue_detail = Some(IssueDetailState::new(issue_id, false));
         for page in IssueDetailPage::ALL {
@@ -324,5 +456,33 @@ mod tests {
                 })
                 .unwrap();
         }
+
+        // 3. Verify clicking the issue banner or URL on Overview dispatches OpenUrl
+        widgets
+            .open_issue_detail
+            .as_mut()
+            .unwrap()
+            .switch_page(IssueDetailPage::Overview);
+        terminal
+            .draw(|f| {
+                render_main_ui(f, &mut widgets, &store, "acme-org", false);
+            })
+            .unwrap();
+
+        let mut banner_events = Vec::new();
+        crate::input::process_mouse_event(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 10,
+                row: 2, // Inside the sticky issue summary banner (rows 1..3)
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &mut widgets,
+            &mut banner_events,
+        );
+        assert!(matches!(
+            banner_events.first(),
+            Some(SlimEvent::OpenUrl(url)) if url == "https://acme.sentry.io/issues/7796091804/"
+        ));
     }
 }

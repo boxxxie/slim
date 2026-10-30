@@ -1,12 +1,14 @@
 use std::{cell::RefCell, rc::Rc};
 
 use compact_str::CompactString;
+use ratatui::layout::Rect;
 
 use crate::{
     config::SlimConfig,
     domain::{
         ActivityEvent, IssueLevel, IssueSort, IssueStatus, ListViewKind, SentryIssue,
     },
+    event::SlimEvent,
     id::{IssueId, ProjectScope},
     notice_service::Notice,
     stores::SentryStore,
@@ -43,6 +45,7 @@ pub struct StatefulWidgets {
     pub modal: Option<ModalState>,
     pub active_notice: Option<Notice>,
     pub last_synced_generation: u64,
+    pub hitboxes: Vec<(Rect, SlimEvent)>,
 }
 
 impl StatefulWidgets {
@@ -59,6 +62,17 @@ impl StatefulWidgets {
             modal: None,
             active_notice: None,
             last_synced_generation: 0,
+            hitboxes: Vec::with_capacity(64),
+        }
+    }
+
+    pub fn clear_hitboxes(&mut self) {
+        self.hitboxes.clear();
+    }
+
+    pub fn register_hitbox(&mut self, rect: Rect, event: SlimEvent) {
+        if rect.width > 0 && rect.height > 0 {
+            self.hitboxes.push((rect, event));
         }
     }
 
@@ -215,7 +229,7 @@ impl StatefulWidgets {
         } else {
             Shortcuts::new(vec![
                 Shortcut::new("1-4", "Views"),
-                Shortcut::new("Enter", "Inspect Issue"),
+                Shortcut::new("Enter/Click", "Inspect Issue"),
                 Shortcut::new("p", "Project"),
                 Shortcut::new("s", "Sort"),
                 Shortcut::new("/", "Filter"),

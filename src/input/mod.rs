@@ -1,5 +1,5 @@
 use compact_str::CompactString;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::{
     domain::{IssueDetailPage, IssueStatus, ListViewKind},
@@ -225,6 +225,23 @@ pub fn process_mouse_event(
     out: &mut Vec<SlimEvent>,
 ) {
     match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if widgets.modal.is_some() {
+                return;
+            }
+            let x = mouse.column;
+            let y = mouse.row;
+            for (rect, ev) in widgets.hitboxes.iter().rev() {
+                if x >= rect.x
+                    && x < rect.x.saturating_add(rect.width)
+                    && y >= rect.y
+                    && y < rect.y.saturating_add(rect.height)
+                {
+                    out.push(ev.clone());
+                    return;
+                }
+            }
+        }
         MouseEventKind::ScrollDown => {
             if widgets.open_issue_detail.is_some() {
                 out.push(SlimEvent::DetailScrollDown(3));

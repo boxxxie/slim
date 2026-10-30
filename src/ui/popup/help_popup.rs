@@ -109,7 +109,7 @@ impl HelpPopup {
             ),
             help_row("g / G", "Jump to first / last row", key_style, desc_style),
             help_row(
-                "Enter",
+                "Enter / Left Click",
                 "Open full-screen Multi-Page Issue Detail Inspector",
                 key_style,
                 desc_style,

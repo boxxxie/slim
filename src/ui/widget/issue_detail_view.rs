@@ -14,6 +14,7 @@ use crate::{
     domain::{
         ActivityEvent, IssueDetailPage, SentryEventDetail, SentryIssue,
     },
+    event::SlimEvent,
     gruvbox::Gruvbox,
     id::IssueId,
     stores::SentryStore,
@@ -71,11 +72,20 @@ impl IssueDetailState {
 pub struct IssueDetailView<'a> {
     store: &'a SentryStore,
     state: &'a mut IssueDetailState,
+    hitboxes: &'a mut Vec<(Rect, SlimEvent)>,
 }
 
 impl<'a> IssueDetailView<'a> {
-    pub fn new(store: &'a SentryStore, state: &'a mut IssueDetailState) -> Self {
-        Self { store, state }
+    pub fn new(
+        store: &'a SentryStore,
+        state: &'a mut IssueDetailState,
+        hitboxes: &'a mut Vec<(Rect, SlimEvent)>,
+    ) -> Self {
+        Self {
+            store,
+            state,
+            hitboxes,
+        }
     }
 
     pub fn render(self, area: Rect, buf: &mut Buffer) {
@@ -100,8 +110,15 @@ impl<'a> IssueDetailView<'a> {
             ])
             .split(area);
 
-        render_issue_banner(chunks[0], buf, issue, event, self.state.loading_event);
-        render_subpage_tabs(chunks[1], buf, self.state, event);
+        render_issue_banner(
+            chunks[0],
+            buf,
+            issue,
+            event,
+            self.state.loading_event,
+            self.hitboxes,
+        );
+        render_subpage_tabs(chunks[1], buf, self.state, event, self.hitboxes);
 
         let body_area = chunks[2];
         let inner_height = body_area.height.saturating_sub(2).max(1);
@@ -165,6 +182,23 @@ impl<'a> IssueDetailView<'a> {
         let inner = block.inner(body_area);
         block.render(body_area, buf);
 
+        if self.state.active_page == IssueDetailPage::Overview && !issue.permalink.is_empty() {
+            let url_line_idx = if issue.culprit.is_empty() { 1usize } else { 2usize };
+            let scroll_idx = clamped_scroll as usize;
+            if url_line_idx >= scroll_idx && url_line_idx < scroll_idx + (inner.height as usize) {
+                let url_y = inner.y + (url_line_idx - scroll_idx) as u16;
+                self.hitboxes.push((
+                    Rect {
+                        x: inner.x,
+                        y: url_y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                    SlimEvent::OpenUrl(issue.permalink.clone()),
+                ));
+            }
+        }
+
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((clamped_scroll, 0))
@@ -188,6 +222,7 @@ fn render_issue_banner(
     issue: &SentryIssue,
     event: Option<&SentryEventDetail>,
     loading_event: bool,
+    hitboxes: &mut Vec<(Rect, SlimEvent)>,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -196,6 +231,10 @@ fn render_issue_banner(
         .style(Style::default().bg(Gruvbox::Dark0Hard.into()));
     let inner = block.inner(area);
     block.render(area, buf);
+
+    if !issue.permalink.is_empty() && area.width > 0 && area.height > 0 {
+        hitboxes.push((area, SlimEvent::OpenUrl(issue.permalink.clone())));
+    }
 
     let unhandled_str = if issue.is_unhandled {
         " • UNHANDLED "
@@ -268,8 +307,13 @@ fn render_subpage_tabs(
     buf: &mut Buffer,
     state: &IssueDetailState,
     event: Option<&SentryEventDetail>,
+    hitboxes: &mut Vec<(Rect, SlimEvent)>,
 ) {
     let mut spans = Vec::with_capacity(16);
+    let mut cur_x = area.x;
+    let max_x = area.x.saturating_add(area.width);
+    let y = area.y;
+
     for page in IssueDetailPage::ALL {
         let is_active = state.active_page == page;
         let style = if is_active {
@@ -302,8 +346,26 @@ fn render_subpage_tabs(
             }
             IssueDetailPage::RawJson => " 5: Raw Event JSON ".to_string(),
         };
-        spans.push(Span::styled(label, style));
-        spans.push(Span::raw("  "));
+        let span = Span::styled(label, style);
+        let w = span.width() as u16;
+        let clamped_w = w.min(max_x.saturating_sub(cur_x));
+        if clamped_w > 0 {
+            hitboxes.push((
+                Rect {
+                    x: cur_x,
+                    y,
+                    width: clamped_w,
+                    height: 1,
+                },
+                SlimEvent::SwitchDetailPage(page),
+            ));
+        }
+        cur_x = cur_x.saturating_add(w);
+        spans.push(span);
+
+        let sep = Span::raw("  ");
+        cur_x = cur_x.saturating_add(sep.width() as u16);
+        spans.push(sep);
     }
     Paragraph::new(Line::from(spans)).render(area, buf);
 }

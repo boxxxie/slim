@@ -235,6 +235,16 @@ impl SlimApp {
                     .list_state
                     .select_last(self.widgets.active_list_view);
             }
+            SlimEvent::SelectAndOpenIssue {
+                row_index,
+                issue_id,
+            } => {
+                self.widgets
+                    .list_state
+                    .table_state
+                    .select(Some(row_index));
+                out.push(SlimEvent::OpenIssueDetail(issue_id));
+            }
             SlimEvent::EscapeOrBack => {
                 if self.widgets.open_issue_detail.is_some() {
                     self.widgets.open_issue_detail = None;

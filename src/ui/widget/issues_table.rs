@@ -11,6 +11,7 @@ use ratatui::{
 
 use crate::{
     domain::{ActivityEvent, ActivityKind, IssueStatus, ListViewKind, SentryIssue},
+    event::SlimEvent,
     gruvbox::Gruvbox,
     id::IssueId,
     theme::theme,
@@ -127,18 +128,27 @@ impl IssuesListState {
     }
 }
 
-pub struct IssuesTableWidget {
+pub struct IssuesTableWidget<'a> {
     pub view: ListViewKind,
     pub focused: bool,
+    pub hitboxes: &'a mut Vec<(Rect, SlimEvent)>,
 }
 
-impl IssuesTableWidget {
-    pub fn new(view: ListViewKind, focused: bool) -> Self {
-        Self { view, focused }
+impl<'a> IssuesTableWidget<'a> {
+    pub fn new(
+        view: ListViewKind,
+        focused: bool,
+        hitboxes: &'a mut Vec<(Rect, SlimEvent)>,
+    ) -> Self {
+        Self {
+            view,
+            focused,
+            hitboxes,
+        }
     }
 }
 
-impl StatefulWidget for IssuesTableWidget {
+impl StatefulWidget for IssuesTableWidget<'_> {
     type State = IssuesListState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
@@ -163,10 +173,43 @@ impl StatefulWidget for IssuesTableWidget {
             .border_style(border_style)
             .style(theme().background);
 
+        let inner = block.inner(area);
+
         if self.view == ListViewKind::IncomingFeed {
             render_incoming_feed_table(area, buf, block, state);
         } else {
             render_issues_table(area, buf, block, state);
+        }
+
+        // Register click hitboxes for each visible row
+        if inner.width > 0 && inner.height > 1 {
+            let offset = state.table_state.offset();
+            let visible_rows = inner.height.saturating_sub(1) as usize;
+            for vis_idx in 0..visible_rows {
+                let row_idx = offset + vis_idx;
+                let issue_id = if self.view == ListViewKind::IncomingFeed {
+                    state.feed_rows.get(row_idx).map(|e| e.issue_id.clone())
+                } else {
+                    state.rows.get(row_idx).map(|i| i.id.clone())
+                };
+                if let Some(id) = issue_id {
+                    let row_rect = Rect {
+                        x: inner.x,
+                        y: inner.y + 1 + (vis_idx as u16),
+                        width: inner.width,
+                        height: 1,
+                    };
+                    self.hitboxes.push((
+                        row_rect,
+                        SlimEvent::SelectAndOpenIssue {
+                            row_index: row_idx,
+                            issue_id: id,
+                        },
+                    ));
+                } else {
+                    break;
+                }
+            }
         }
     }
 }

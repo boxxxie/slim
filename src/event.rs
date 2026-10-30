@@ -70,6 +70,10 @@ pub enum SlimEvent {
     CursorPageUp,
     CursorFirst,
     CursorLast,
+    SelectAndOpenIssue {
+        row_index: usize,
+        issue_id: IssueId,
+    },
     EscapeOrBack,
 
     // Multi-Page Issue Detail View navigation
