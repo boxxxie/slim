@@ -23,6 +23,21 @@ use crate::{
     id::{ActivityId, IssueId, ProjectId},
 };
 
+const DEFAULT_HYDRATE_MAX_ISSUES: usize = 500;
+const DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS: usize = 300;
+const DEFAULT_HYDRATE_MAX_PROJECTS: usize = 200;
+
+const DUCKDB_LOW_MEMORY_SQL: &str = "\
+SET threads=1;
+SET external_threads=1;
+SET async_threads=1;
+SET preserve_insertion_order=false;
+SET memory_limit='8MB';
+SET allocator_flush_threshold='512KB';
+SET allocator_bulk_deallocation_flush_threshold='512KB';
+SET wal_autocheckpoint='256KB';
+";
+
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
     id VARCHAR PRIMARY KEY,
@@ -177,12 +192,14 @@ impl SentryStore {
         if self.db_path.exists() {
             self.load_existing_rows(&duckdb_bin);
         } else {
+            let init_sql = format!("{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}");
             let _ = Command::new(&duckdb_bin)
+                .env("MALLOC_ARENA_MAX", "1")
                 .arg("-dark-mode")
                 .arg("-batch")
                 .arg(&self.db_path)
                 .arg("-c")
-                .arg(SCHEMA_SQL)
+                .arg(init_sql)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -192,49 +209,52 @@ impl SentryStore {
     }
 
     fn load_existing_rows(&mut self, duckdb_bin: &Path) {
+        let init_sql = format!("CHECKPOINT;\n{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}");
         let _ = Command::new(duckdb_bin)
+            .env("MALLOC_ARENA_MAX", "1")
             .arg("-dark-mode")
             .arg("-batch")
             .arg(&self.db_path)
             .arg("-c")
-            .arg(SCHEMA_SQL)
+            .arg(init_sql)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
 
-        for proj in query_payloads::<SentryProject>(
-            duckdb_bin,
-            &self.db_path,
-            "SELECT payload FROM projects;",
-        ) {
+        let projects_sql = format!(
+            "SELECT payload FROM (SELECT payload FROM projects ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_PROJECTS});"
+        );
+        for proj in query_payloads::<SentryProject>(duckdb_bin, &self.db_path, &projects_sql) {
             self.projects.insert(proj.id.clone(), proj);
         }
-        for issue in query_payloads::<SentryIssue>(
-            duckdb_bin,
-            &self.db_path,
-            "SELECT payload FROM issues;",
-        ) {
+
+        let issues_tail_scan = DEFAULT_HYDRATE_MAX_ISSUES.saturating_mul(4);
+        let issues_sql = format!(
+            "SELECT payload FROM (SELECT payload, last_seen FROM issues ORDER BY rowid DESC LIMIT {issues_tail_scan}) ORDER BY last_seen DESC LIMIT {DEFAULT_HYDRATE_MAX_ISSUES};"
+        );
+        for issue in query_payloads::<SentryIssue>(duckdb_bin, &self.db_path, &issues_sql) {
             self.issues.insert(issue.id.clone(), issue);
         }
-        for ev_detail in query_payloads::<SentryEventDetail>(
-            duckdb_bin,
-            &self.db_path,
-            "SELECT payload FROM issue_events;",
-        ) {
+
+        let events_sql = format!(
+            "SELECT payload FROM (SELECT payload FROM issue_events ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_ISSUES});"
+        );
+        for ev_detail in query_payloads::<SentryEventDetail>(duckdb_bin, &self.db_path, &events_sql)
+        {
             self.events_by_issue
                 .insert(ev_detail.issue_id.clone(), ev_detail);
         }
-        for act in query_payloads::<ActivityEvent>(
-            duckdb_bin,
-            &self.db_path,
-            "SELECT payload FROM activity_events ORDER BY timestamp DESC;",
-        ) {
+
+        let activity_sql = format!(
+            "SELECT payload FROM (SELECT payload, timestamp FROM activity_events ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS}) ORDER BY timestamp DESC LIMIT {DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS};"
+        );
+        for act in query_payloads::<ActivityEvent>(duckdb_bin, &self.db_path, &activity_sql) {
             self.activity_events.push_back(act);
         }
         if let Some(meta) = query_payloads::<SyncMeta>(
             duckdb_bin,
             &self.db_path,
-            "SELECT payload FROM sync_meta WHERE id = 1;",
+            "SELECT payload FROM sync_meta WHERE id = 1 LIMIT 1;",
         )
         .into_iter()
         .next()
@@ -263,6 +283,7 @@ impl SentryStore {
         event_sender: Option<&Sender<SlimEvent>>,
     ) {
         let mut child: Child = match Command::new(duckdb_bin)
+            .env("MALLOC_ARENA_MAX", "1")
             .arg("-dark-mode")
             .arg("-batch")
             .arg(&self.db_path)
@@ -284,7 +305,10 @@ impl SentryStore {
         };
         let stdout = child.stdout.take();
 
-        let _ = writeln!(stdin, "{SCHEMA_SQL}");
+        let _ = writeln!(
+            stdin,
+            "CHECKPOINT;\n{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}"
+        );
 
         let mut quack_listen_uri = None;
         let mut quack_token = None;
@@ -791,12 +815,15 @@ fn upsert_sync_meta_sql(meta: &SyncMeta) -> String {
 }
 
 fn query_payloads<T: DeserializeOwned>(duckdb_bin: &Path, db_path: &Path, sql: &str) -> Vec<T> {
+    let full_sql = format!("{DUCKDB_LOW_MEMORY_SQL}\n{sql}");
     let Ok(out) = Command::new(duckdb_bin)
+        .env("MALLOC_ARENA_MAX", "1")
         .arg("-dark-mode")
+        .arg("-readonly")
         .arg("-json")
         .arg(db_path)
         .arg("-c")
-        .arg(sql)
+        .arg(full_sql)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()

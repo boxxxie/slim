@@ -82,8 +82,26 @@ struct CliArgs {
     debug: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        // M_ARENA_MAX = -8: restrict glibc malloc to a single arena so worker threads
+        // don't reserve multiple 64 MB virtual memory arenas.
+        let _ = mallopt(-8, 1);
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args = CliArgs::parse();
     let config_path = args.config.unwrap_or_else(default_config_path);
 
