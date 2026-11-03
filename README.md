@@ -22,8 +22,12 @@ Unlike 2-tile split-screen monitors, `slim` uses a dedicated **full-screen singl
 - **Quick Triage & Clipboard**:
   - Resolve (`R`), Ignore (`I`), or Unresolve (`U`) issues directly from the list or detail inspector.
   - Copy Short ID (`y`), copy a formatted Markdown issue + stacktrace summary (`Y`), or open in browser (`o` / `w`).
-- **Buffered Desktop Notifications (`notify-send`)**:
-  - Alerts on new issues, regressions, and event spikes with per-issue deduplication and multi-issue burst coalescing.
+- **Stochastic & Hawkes Notification Relevance Filter (`notify-send` + In-App Banners)**:
+  - **Hawkes Self-Inhibition Cooldown**: Each emitted notification records a timestamped emission in DuckDB (`notification_emissions`) that exponentially dampens both the specific issue (`issue_cooldown_half_life_minutes = 45.0`) and the noisy project/app (`project_cooldown_half_life_minutes = 20.0`).
+  - **Baseline-Relative Novelty & Chronic-Repeater Decay**: Scores `+delta` events relative to historical/24h baseline volume so chronic background repeaters (e.g. 40,000-event workers firing every 30s) decay toward zero probability while genuinely new errors pass immediately.
+  - **User Interaction Boost (`user_interactions`)**: Issues and projects you inspect (`Enter`), open in browser (`o`), copy (`y`/`Y`), or unresolve (`U`) receive a Hawkes relevance boost, while ignored issues (`I`) receive strong negative suppression.
+  - **Stochastic Gumbel-Top-k & Logistic Gate (`m` to cycle modes)**: Converts net relevance (`raw_signal + user_boost - issue_fatigue - project_fatigue`) into a logistic emission probability, caps notifications per flush window (`max_notifications_per_flush = 2`), and automatically downgrades `critical` desktop urgency on repetitive unhandled issues.
+  - **Full Raw Stream Preserved**: Suppressed notifications never drop data—all activity events remain visible in the `3: Incoming Feed` tab.
 - **DuckDB 2.0 + Quack Server (`~/.local/share/slim/slim.duckdb`, port `9495`)**:
   - Instant offline startup from local DuckDB cache and concurrent SQL inspection via `slim --print-quack-attach`.
 
@@ -73,6 +77,17 @@ notify_on_new_issues = true
 notify_on_regressions = true
 spike_min_delta = 5
 desktop_notifications_enabled = true
+stochastic_filter_enabled = true
+filter_mode = "hybrid" # "hybrid", "stochastic", "deterministic", or "legacy"
+stochastic_temperature = 0.75
+relevance_threshold = 18.0
+max_notifications_per_flush = 2
+issue_cooldown_half_life_minutes = 45.0
+project_cooldown_half_life_minutes = 20.0
+issue_fatigue_weight = 32.0
+project_fatigue_weight = 10.0
+interaction_half_life_hours = 24.0
+interaction_weight = 1.0
 ```
 
 ---

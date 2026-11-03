@@ -14,6 +14,7 @@ pub mod logging;
 pub mod notice_service;
 pub mod notification_buffer;
 pub mod os_notify;
+pub mod relevance;
 pub mod rendering;
 pub mod result;
 pub mod slim_app;

@@ -22,9 +22,10 @@ pub struct ConfigPopup {
 }
 
 impl ConfigPopup {
-    pub const FIELD_COUNT: usize = 6;
+    pub const FIELD_COUNT: usize = 8;
 
-    pub fn new(config: SlimConfig) -> Self {
+    pub fn new(mut config: SlimConfig) -> Self {
+        config.notifications.filter_mode = config.notifications.effective_filter_mode();
         Self {
             config,
             selected_field: 0,
@@ -73,9 +74,19 @@ impl ConfigPopup {
                     !self.config.notifications.desktop_notifications_enabled;
             }
             4 => {
-                self.config.effects.animations_enabled = !self.config.effects.animations_enabled;
+                let next_mode = self.config.notifications.effective_filter_mode().cycle();
+                self.config
+                    .notifications
+                    .set_effective_filter_mode(next_mode);
             }
             5 => {
+                self.editing = true;
+                self.edit_buffer = format!("{:.1}", self.config.notifications.relevance_threshold);
+            }
+            6 => {
+                self.config.effects.animations_enabled = !self.config.effects.animations_enabled;
+            }
+            7 => {
                 self.editing = true;
                 self.edit_buffer = self
                     .config
@@ -114,6 +125,11 @@ impl ConfigPopup {
                 }
             }
             5 => {
+                if let Ok(theta) = trimmed.parse::<f64>() {
+                    self.config.notifications.relevance_threshold = theta.clamp(0.0, 100.0);
+                }
+            }
+            7 => {
                 self.token_edited = true;
                 if trimmed.is_empty() {
                     self.config.sentry.auth_token = None;
@@ -133,7 +149,7 @@ impl ConfigPopup {
     }
 
     pub fn popup_area(terminal_area: Rect) -> Rect {
-        terminal_area.inner_centered(74, 18)
+        terminal_area.inner_centered(76, 22)
     }
 
     pub fn render_in(&self, area: Rect, buf: &mut Buffer) {
@@ -182,6 +198,18 @@ impl ConfigPopup {
                     .notifications
                     .desktop_notifications_enabled
                     .to_string(),
+            ),
+            (
+                "Notification Filter Mode",
+                self.config
+                    .notifications
+                    .effective_filter_mode()
+                    .label()
+                    .to_string(),
+            ),
+            (
+                "Relevance Threshold (θ)",
+                format!("{:.1}", self.config.notifications.relevance_threshold),
             ),
             (
                 "TachyonFX Animations",

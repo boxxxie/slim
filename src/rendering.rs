@@ -197,8 +197,17 @@ fn render_top_chrome(
 
     let project_label = widgets.filter_scope.project_scope.label();
     let sort_label = widgets.filter_scope.sort.label();
+    let notif_mode_label = widgets.notification_filter_mode.label();
+    let notif_pill = if widgets.notifications_emitted > 0 || widgets.notifications_suppressed > 0 {
+        format!(
+            "[Notif: {notif_mode_label} ({}↑ -{})]",
+            widgets.notifications_emitted, widgets.notifications_suppressed
+        )
+    } else {
+        format!("[Notif: {notif_mode_label}]")
+    };
 
-    let mut spans = Vec::with_capacity(20);
+    let mut spans = Vec::with_capacity(24);
     let mut cur_x = area.x;
     let max_x = area.x.saturating_add(area.width);
     let y = area.y;
@@ -284,6 +293,16 @@ fn render_top_chrome(
         max_x,
         Span::styled(format!("[Sort: {sort_label}]"), theme().tag_key),
         Some(SlimEvent::CycleIssueSort),
+    );
+    push_clickable_span(&mut spans, hitboxes, &mut cur_x, y, max_x, Span::raw(" "), None);
+    push_clickable_span(
+        &mut spans,
+        hitboxes,
+        &mut cur_x,
+        y,
+        max_x,
+        Span::styled(notif_pill, theme().tag_val),
+        Some(SlimEvent::CycleNotificationFilterMode),
     );
 
     if in_detail {

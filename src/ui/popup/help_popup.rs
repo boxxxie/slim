@@ -223,6 +223,12 @@ impl HelpPopup {
                 key_style,
                 desc_style,
             ),
+            help_row(
+                "m",
+                "Cycle Notification Filter Mode (hybrid -> 100% stochastic -> deterministic -> legacy)",
+                key_style,
+                desc_style,
+            ),
             help_row("n", "Recall last notification banner", key_style, desc_style),
             help_row("c", "Open Configuration popup", key_style, desc_style),
             help_row("?", "Toggle this Help popup", key_style, desc_style),

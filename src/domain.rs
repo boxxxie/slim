@@ -489,6 +489,124 @@ pub struct ActivityEvent {
     pub permalink: CompactString,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationFilterMode {
+    /// Hybrid stochastic filtering: genuinely novel new issues & fresh low-fatigue regressions
+    /// pass with high priority, while chronic repeaters and noisy projects are dampened by
+    /// Hawkes self-inhibition, relative baseline novelty, and Gumbel-Top-k / logistic sampling.
+    #[default]
+    Hybrid,
+    /// 100% Stochastic logistic / Gumbel-Top-k sampling across all candidate notifications.
+    Stochastic,
+    /// Deterministic relevance + Hawkes fatigue threshold (no random Gumbel noise).
+    Deterministic,
+    /// Legacy unfiltered notification behavior (emits every spike/regression/new issue).
+    Legacy,
+}
+
+impl NotificationFilterMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Hybrid => Self::Stochastic,
+            Self::Stochastic => Self::Deterministic,
+            Self::Deterministic => Self::Legacy,
+            Self::Legacy => Self::Hybrid,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Stochastic => "100% stochastic",
+            Self::Deterministic => "deterministic",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserInteractionKind {
+    CopyIssueId,
+    InspectIssueDetail,
+    OpenIssueWeb,
+    CopyIssueSummary,
+    ResolveIssue,
+    UnresolveIssue,
+    IgnoreIssue,
+    ManualRefreshIssue,
+}
+
+impl UserInteractionKind {
+    pub fn base_weight(self) -> f64 {
+        match self {
+            Self::UnresolveIssue => 26.0,
+            Self::OpenIssueWeb => 24.0,
+            Self::CopyIssueSummary => 20.0,
+            Self::InspectIssueDetail => 16.0,
+            Self::ManualRefreshIssue => 14.0,
+            Self::ResolveIssue => 8.0,
+            Self::CopyIssueId => 10.0,
+            // Ignoring an issue actively suppresses future notification relevance
+            Self::IgnoreIssue => -45.0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CopyIssueId => "copy_issue_id",
+            Self::InspectIssueDetail => "inspect_issue_detail",
+            Self::OpenIssueWeb => "open_issue_web",
+            Self::CopyIssueSummary => "copy_issue_summary",
+            Self::ResolveIssue => "resolve_issue",
+            Self::UnresolveIssue => "unresolve_issue",
+            Self::IgnoreIssue => "ignore_issue",
+            Self::ManualRefreshIssue => "manual_refresh_issue",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserInteraction {
+    pub id: u64,
+    pub issue_id: IssueId,
+    pub short_id: CompactString,
+    pub project_slug: CompactString,
+    pub kind: UserInteractionKind,
+    pub weight: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotificationEmission {
+    pub id: u64,
+    pub issue_id: IssueId,
+    pub short_id: CompactString,
+    pub project_slug: CompactString,
+    pub urgency: CompactString,
+    pub score: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainChangeKind {
+    NewIssue,
+    Regressed,
+    EventSpike,
+}
+
+impl DomainChangeKind {
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::NewIssue => "NEW",
+            Self::Regressed => "REGRESSED",
+            Self::EventSpike => "SPIKE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainChange {
     pub issue_id: IssueId,
@@ -497,9 +615,17 @@ pub struct DomainChange {
     pub issue_title: CompactString,
     pub summary: CompactString,
     pub url: CompactString,
+    pub kind: DomainChangeKind,
     pub level: IssueLevel,
+    pub priority: IssuePriority,
+    pub is_unhandled: bool,
     pub is_critical: bool,
     pub delta_events: u64,
+    pub total_events: u64,
+    pub events_24h: u64,
+    pub user_count: u64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

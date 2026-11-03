@@ -5,7 +5,7 @@ use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::ListViewKind,
+    domain::{ListViewKind, NotificationFilterMode},
     result::{Result, SlimError},
 };
 
@@ -137,7 +137,7 @@ impl Default for DatabaseSection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotificationsSection {
     #[serde(default = "default_notification_check_seconds")]
     pub notification_check_seconds: u64,
@@ -155,6 +155,54 @@ pub struct NotificationsSection {
     pub coalesce_threshold: usize,
     #[serde(default = "default_true")]
     pub desktop_notifications_enabled: bool,
+    /// Enable stochastic & Hawkes notification relevance filtering (default: true)
+    #[serde(default = "default_true")]
+    pub stochastic_filter_enabled: bool,
+    /// Notification filter mode: "hybrid" (default), "stochastic", "deterministic", or "legacy"
+    #[serde(default)]
+    pub filter_mode: NotificationFilterMode,
+    /// Temperature tau for Gumbel-Max / logistic stochastic notification gate (default: 0.75)
+    #[serde(default = "default_stochastic_temperature")]
+    pub stochastic_temperature: f64,
+    /// Minimum net relevance score center theta for notification emission (default: 18.0)
+    #[serde(default = "default_relevance_threshold")]
+    pub relevance_threshold: f64,
+    /// Maximum desktop/in-app notifications emitted per flush window (default: 2)
+    #[serde(default = "default_max_notifications_per_flush")]
+    pub max_notifications_per_flush: usize,
+    /// Half-life in minutes for per-issue Hawkes self-inhibition cooldown (default: 45.0)
+    #[serde(default = "default_issue_cooldown_half_life_minutes")]
+    pub issue_cooldown_half_life_minutes: f64,
+    /// Half-life in minutes for per-project Hawkes self-inhibition cooldown (default: 20.0)
+    #[serde(default = "default_project_cooldown_half_life_minutes")]
+    pub project_cooldown_half_life_minutes: f64,
+    /// Penalty weight per recent notification on the same issue (default: 32.0)
+    #[serde(default = "default_issue_fatigue_weight")]
+    pub issue_fatigue_weight: f64,
+    /// Penalty weight per recent notification on the same project/app (default: 10.0)
+    #[serde(default = "default_project_fatigue_weight")]
+    pub project_fatigue_weight: f64,
+    /// Half-life in hours for user interaction Hawkes boost (default: 24.0)
+    #[serde(default = "default_interaction_half_life_hours")]
+    pub interaction_half_life_hours: f64,
+    /// Multiplier for user interaction Hawkes boost (default: 1.0; 0.0 to disable)
+    #[serde(default = "default_interaction_weight")]
+    pub interaction_weight: f64,
+}
+
+impl NotificationsSection {
+    pub fn effective_filter_mode(&self) -> NotificationFilterMode {
+        if self.stochastic_filter_enabled {
+            self.filter_mode
+        } else {
+            NotificationFilterMode::Legacy
+        }
+    }
+
+    pub fn set_effective_filter_mode(&mut self, mode: NotificationFilterMode) {
+        self.filter_mode = mode;
+        self.stochastic_filter_enabled = mode != NotificationFilterMode::Legacy;
+    }
 }
 
 fn default_notification_check_seconds() -> u64 {
@@ -169,6 +217,42 @@ fn default_coalesce_threshold() -> usize {
     3
 }
 
+fn default_stochastic_temperature() -> f64 {
+    0.75
+}
+
+fn default_relevance_threshold() -> f64 {
+    18.0
+}
+
+fn default_max_notifications_per_flush() -> usize {
+    2
+}
+
+fn default_issue_cooldown_half_life_minutes() -> f64 {
+    45.0
+}
+
+fn default_project_cooldown_half_life_minutes() -> f64 {
+    20.0
+}
+
+fn default_issue_fatigue_weight() -> f64 {
+    32.0
+}
+
+fn default_project_fatigue_weight() -> f64 {
+    10.0
+}
+
+fn default_interaction_half_life_hours() -> f64 {
+    24.0
+}
+
+fn default_interaction_weight() -> f64 {
+    1.0
+}
+
 impl Default for NotificationsSection {
     fn default() -> Self {
         Self {
@@ -180,6 +264,17 @@ impl Default for NotificationsSection {
             per_issue_dedup: true,
             coalesce_threshold: default_coalesce_threshold(),
             desktop_notifications_enabled: true,
+            stochastic_filter_enabled: true,
+            filter_mode: NotificationFilterMode::default(),
+            stochastic_temperature: default_stochastic_temperature(),
+            relevance_threshold: default_relevance_threshold(),
+            max_notifications_per_flush: default_max_notifications_per_flush(),
+            issue_cooldown_half_life_minutes: default_issue_cooldown_half_life_minutes(),
+            project_cooldown_half_life_minutes: default_project_cooldown_half_life_minutes(),
+            issue_fatigue_weight: default_issue_fatigue_weight(),
+            project_fatigue_weight: default_project_fatigue_weight(),
+            interaction_half_life_hours: default_interaction_half_life_hours(),
+            interaction_weight: default_interaction_weight(),
         }
     }
 }
@@ -205,7 +300,7 @@ impl Default for EffectsSection {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlimConfig {
     #[serde(default)]
     pub sentry: SentrySection,

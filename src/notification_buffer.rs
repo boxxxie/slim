@@ -1,19 +1,19 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::mpsc::Sender,
-    time::Duration,
-};
+use std::{sync::mpsc::Sender, time::Duration};
 
+use chrono::Utc;
 use compact_str::CompactString;
 use tokio::sync::watch;
 
 use crate::{
     config::{NotificationsSection, SlimConfig},
     dispatcher::Dispatcher,
-    domain::DomainChange,
+    domain::{
+        DomainChange, NotificationEmission, NotificationFilterMode, UserInteraction,
+    },
     event::SlimEvent,
     id::IssueId,
-    os_notify::{send_os_notification, NotifyUrgency},
+    os_notify::{NotifyUrgency, send_os_notification},
+    relevance::{NotificationEvaluationResult, NotificationRelevanceContext, evaluate_notifications},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,11 +27,19 @@ pub struct EmittedNotification {
 #[derive(Debug, Default)]
 pub struct NotificationBuffer {
     queued: Vec<DomainChange>,
+    flush_nonce: u64,
+    pub total_emitted: u64,
+    pub total_suppressed: u64,
 }
 
 impl NotificationBuffer {
     pub fn new() -> Self {
-        Self { queued: Vec::new() }
+        Self {
+            queued: Vec::new(),
+            flush_nonce: 0,
+            total_emitted: 0,
+            total_suppressed: 0,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -46,124 +54,45 @@ impl NotificationBuffer {
         self.queued.extend(changes);
     }
 
+    /// Purges any pending un-flushed changes for an issue when the user resolves or ignores it.
+    pub fn drop_issue(&mut self, issue_id: &IssueId) {
+        self.queued.retain(|change| &change.issue_id != issue_id);
+    }
+
     pub fn evaluate_and_flush(
         &mut self,
         config: &NotificationsSection,
+        recent_emissions: &[NotificationEmission],
+        user_interactions: &[UserInteraction],
+        filter_mode: NotificationFilterMode,
         send_desktop: bool,
-    ) -> Vec<EmittedNotification> {
+    ) -> NotificationEvaluationResult {
         if self.queued.is_empty() {
-            return Vec::new();
+            return NotificationEvaluationResult::default();
         }
 
         let drained = std::mem::take(&mut self.queued);
+        self.flush_nonce = self.flush_nonce.wrapping_add(1);
 
-        let mut by_issue: BTreeMap<IssueId, Vec<DomainChange>> = BTreeMap::new();
-        for change in drained {
-            by_issue
-                .entry(change.issue_id.clone())
-                .or_default()
-                .push(change);
-        }
+        let ctx = NotificationRelevanceContext {
+            config,
+            recent_emissions,
+            user_interactions,
+            filter_mode,
+            now: Utc::now(),
+            flush_nonce: self.flush_nonce,
+        };
 
-        let mut emitted = Vec::new();
-        let mut standard_groups: Vec<(IssueId, Vec<DomainChange>)> = Vec::new();
-
-        for (issue_id, group) in by_issue {
-            let is_critical =
-                config.critical_unhandled_alert && group.iter().any(|c| c.is_critical);
-
-            if is_critical {
-                let first = &group[0];
-                let summaries: Vec<&str> = group.iter().map(|c| c.summary.as_str()).collect();
-                let combined_summary = deduplicate_summaries(&summaries);
-                emitted.push(EmittedNotification {
-                    summary: format!(
-                        "[{} • {}] {} — {}",
-                        first.project_slug,
-                        first.level.label(),
-                        first.short_id,
-                        first.issue_title
-                    )
-                    .into(),
-                    body: combined_summary.into(),
-                    urgency: NotifyUrgency::Critical,
-                    url: Some(first.url.clone()),
-                });
-            } else {
-                standard_groups.push((issue_id, group));
-            }
-        }
-
-        let coalesce_threshold = config.coalesce_threshold.max(1);
-        if standard_groups.len() > coalesce_threshold {
-            let issue_count = standard_groups.len();
-            let projects: BTreeSet<&str> = standard_groups
-                .iter()
-                .filter_map(|(_, g)| g.first().map(|c| c.project_slug.as_str()))
-                .collect();
-            let total_delta: u64 = standard_groups
-                .iter()
-                .flat_map(|(_, g)| g.iter().map(|c| c.delta_events))
-                .sum();
-
-            let proj_label = if projects.is_empty() {
-                "Sentry".to_string()
-            } else {
-                projects.into_iter().take(4).collect::<Vec<_>>().join(", ")
-            };
-            let summary = if total_delta > 0 {
-                format!("{issue_count} Sentry issues active in {proj_label} (+{total_delta} events)")
-            } else {
-                format!("{issue_count} Sentry issues updated in {proj_label}")
-            };
-
-            let identifiers: Vec<&str> = standard_groups
-                .iter()
-                .filter_map(|(_, g)| g.first().map(|c| c.short_id.as_str()))
-                .take(8)
-                .collect();
-
-            emitted.push(EmittedNotification {
-                summary: summary.into(),
-                body: format!("Issues: {}", identifiers.join(", ")).into(),
-                urgency: NotifyUrgency::Normal,
-                url: None,
-            });
-        } else {
-            for (_issue_id, group) in standard_groups {
-                if config.per_issue_dedup {
-                    let first = &group[0];
-                    let summaries: Vec<&str> = group.iter().map(|c| c.summary.as_str()).collect();
-                    let combined_summary = deduplicate_summaries(&summaries);
-                    emitted.push(EmittedNotification {
-                        summary: format!(
-                            "[{}] {}: {}",
-                            first.project_slug, first.short_id, first.issue_title
-                        )
-                        .into(),
-                        body: combined_summary.into(),
-                        urgency: NotifyUrgency::Normal,
-                        url: Some(first.url.clone()),
-                    });
-                } else {
-                    for change in group {
-                        emitted.push(EmittedNotification {
-                            summary: format!(
-                                "[{}] {}: {}",
-                                change.project_slug, change.short_id, change.issue_title
-                            )
-                            .into(),
-                            body: change.summary,
-                            urgency: NotifyUrgency::Normal,
-                            url: Some(change.url),
-                        });
-                    }
-                }
-            }
-        }
+        let result = evaluate_notifications(drained, &ctx);
+        self.total_emitted = self
+            .total_emitted
+            .saturating_add(result.emitted.len() as u64);
+        self.total_suppressed = self
+            .total_suppressed
+            .saturating_add(result.suppressed_count as u64);
 
         if send_desktop && config.desktop_notifications_enabled {
-            for alert in &emitted {
+            for alert in &result.emitted {
                 send_os_notification(
                     alert.summary.as_str(),
                     alert.body.as_str(),
@@ -174,18 +103,8 @@ impl NotificationBuffer {
             }
         }
 
-        emitted
+        result
     }
-}
-
-fn deduplicate_summaries(summaries: &[&str]) -> String {
-    let mut unique: Vec<&str> = Vec::new();
-    for &s in summaries {
-        if !unique.contains(&s) {
-            unique.push(s);
-        }
-    }
-    unique.join("; ")
 }
 
 pub fn spawn_notification_buffer_timer(

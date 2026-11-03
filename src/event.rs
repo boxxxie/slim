@@ -117,6 +117,7 @@ pub enum SlimEvent {
 
     // Notifications & logging
     FlushNotificationBuffer,
+    CycleNotificationFilterMode,
     NotificationDismiss,
     NotificationRecallLast,
     ActivityNotice(CompactString),

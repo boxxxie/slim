@@ -16,8 +16,9 @@ use tracing::{info, warn};
 use crate::{
     config::{DatabaseSection, NotificationsSection, default_quack_token_path},
     domain::{
-        ActivityEvent, ActivityKind, DomainChange, HydrationState, IssueLevel, IssueStatus,
-        SentryEventDetail, SentryIssue, SentryProject, SyncMeta,
+        ActivityEvent, ActivityKind, DomainChange, DomainChangeKind, HydrationState, IssueLevel,
+        IssueStatus, NotificationEmission, SentryEventDetail, SentryIssue, SentryProject, SyncMeta,
+        UserInteraction, UserInteractionKind,
     },
     event::{PollBatchPayload, SlimEvent},
     id::{ActivityId, IssueId, ProjectId},
@@ -26,6 +27,8 @@ use crate::{
 const DEFAULT_HYDRATE_MAX_ISSUES: usize = 500;
 const DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS: usize = 300;
 const DEFAULT_HYDRATE_MAX_PROJECTS: usize = 200;
+const DEFAULT_HYDRATE_MAX_INTERACTIONS: usize = 500;
+const DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS: usize = 500;
 
 const DUCKDB_LOW_MEMORY_SQL: &str = "\
 SET threads=1;
@@ -86,6 +89,26 @@ CREATE TABLE IF NOT EXISTS activity_events (
 );
 CREATE TABLE IF NOT EXISTS sync_meta (
     id INTEGER PRIMARY KEY,
+    payload VARCHAR
+);
+CREATE TABLE IF NOT EXISTS user_interactions (
+    id BIGINT PRIMARY KEY,
+    issue_id VARCHAR,
+    short_id VARCHAR,
+    project_slug VARCHAR,
+    kind VARCHAR,
+    weight DOUBLE,
+    created_at VARCHAR,
+    payload VARCHAR
+);
+CREATE TABLE IF NOT EXISTS notification_emissions (
+    id BIGINT PRIMARY KEY,
+    issue_id VARCHAR,
+    short_id VARCHAR,
+    project_slug VARCHAR,
+    urgency VARCHAR,
+    score DOUBLE,
+    created_at VARCHAR,
     payload VARCHAR
 );
 "#;
@@ -150,6 +173,8 @@ pub struct SentryStore {
     pub issues: HashMap<IssueId, SentryIssue>,
     pub events_by_issue: HashMap<IssueId, SentryEventDetail>,
     pub activity_events: VecDeque<ActivityEvent>,
+    pub user_interactions: Vec<UserInteraction>,
+    pub notification_emissions: Vec<NotificationEmission>,
     pub sync_meta: SyncMeta,
     pub hydration_state: HydrationState,
     pub generation: u64,
@@ -164,6 +189,8 @@ impl SentryStore {
             issues: HashMap::new(),
             events_by_issue: HashMap::new(),
             activity_events: VecDeque::new(),
+            user_interactions: Vec::new(),
+            notification_emissions: Vec::new(),
             sync_meta: SyncMeta::default(),
             hydration_state: HydrationState::ColdBootstrap,
             generation: 1,
@@ -251,6 +278,19 @@ impl SentryStore {
         for act in query_payloads::<ActivityEvent>(duckdb_bin, &self.db_path, &activity_sql) {
             self.activity_events.push_back(act);
         }
+
+        let interactions_sql = format!(
+            "SELECT payload FROM (SELECT payload, created_at FROM user_interactions ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_INTERACTIONS}) ORDER BY created_at DESC LIMIT {DEFAULT_HYDRATE_MAX_INTERACTIONS};"
+        );
+        self.user_interactions =
+            query_payloads::<UserInteraction>(duckdb_bin, &self.db_path, &interactions_sql);
+
+        let emissions_sql = format!(
+            "SELECT payload FROM (SELECT payload, created_at FROM notification_emissions ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS}) ORDER BY created_at DESC LIMIT {DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS};"
+        );
+        self.notification_emissions =
+            query_payloads::<NotificationEmission>(duckdb_bin, &self.db_path, &emissions_sql);
+
         if let Some(meta) = query_payloads::<SyncMeta>(
             duckdb_bin,
             &self.db_path,
@@ -486,10 +526,18 @@ impl SentryStore {
                                 issue_title: issue.title.clone(),
                                 summary,
                                 url: issue.permalink.clone(),
+                                kind: DomainChangeKind::NewIssue,
                                 level: issue.level,
+                                priority: issue.priority,
+                                is_unhandled: issue.is_unhandled,
                                 is_critical: issue.is_unhandled
                                     || issue.level == IssueLevel::Fatal,
                                 delta_events: issue.count,
+                                total_events: issue.count,
+                                events_24h: issue.events_24h(),
+                                user_count: issue.user_count,
+                                first_seen: issue.first_seen,
+                                last_seen: issue.last_seen,
                             });
                         }
                     }
@@ -529,9 +577,17 @@ impl SentryStore {
                                     issue_title: issue.title.clone(),
                                     summary,
                                     url: issue.permalink.clone(),
+                                    kind: DomainChangeKind::Regressed,
                                     level: issue.level,
+                                    priority: issue.priority,
+                                    is_unhandled: issue.is_unhandled,
                                     is_critical: true,
                                     delta_events: issue.count.saturating_sub(old.count),
+                                    total_events: issue.count,
+                                    events_24h: issue.events_24h(),
+                                    user_count: issue.user_count,
+                                    first_seen: issue.first_seen,
+                                    last_seen: issue.last_seen,
                                 });
                             }
                         } else if issue.count > old.count {
@@ -572,10 +628,18 @@ impl SentryStore {
                                     issue_title: issue.title.clone(),
                                     summary,
                                     url: issue.permalink.clone(),
+                                    kind: DomainChangeKind::EventSpike,
                                     level: issue.level,
+                                    priority: issue.priority,
+                                    is_unhandled: issue.is_unhandled,
                                     is_critical: issue.is_unhandled
                                         || issue.level == IssueLevel::Fatal,
                                     delta_events: delta,
+                                    total_events: issue.count,
+                                    events_24h: issue.events_24h(),
+                                    user_count: issue.user_count,
+                                    first_seen: issue.first_seen,
+                                    last_seen: issue.last_seen,
                                 });
                             }
                         } else if old.status != issue.status {
@@ -733,6 +797,66 @@ impl SentryStore {
             self.generation = self.generation.wrapping_add(1);
         }
     }
+
+    pub fn record_interaction(&mut self, issue_id: &IssueId, kind: UserInteractionKind) {
+        let Some(issue) = self.issues.get(issue_id) else {
+            return;
+        };
+        let now = Utc::now();
+        let id = (now.timestamp_millis().max(1) as u64)
+            .wrapping_mul(100)
+            .wrapping_add((self.user_interactions.len() as u64) % 97);
+        let interaction = UserInteraction {
+            id,
+            issue_id: issue.id.clone(),
+            short_id: issue.short_id.clone(),
+            project_slug: issue.project_slug.clone(),
+            kind,
+            weight: kind.base_weight(),
+            created_at: now,
+        };
+        let sql = format!(
+            "BEGIN TRANSACTION;\n{}\
+             DELETE FROM user_interactions WHERE id NOT IN (\
+                 SELECT id FROM user_interactions ORDER BY created_at DESC LIMIT {}\
+             );\n\
+             COMMIT;\n",
+            upsert_user_interaction_sql(&interaction),
+            DEFAULT_HYDRATE_MAX_INTERACTIONS
+        );
+        self.user_interactions.insert(0, interaction);
+        if self.user_interactions.len() > DEFAULT_HYDRATE_MAX_INTERACTIONS {
+            self.user_interactions.truncate(DEFAULT_HYDRATE_MAX_INTERACTIONS);
+        }
+        if let Some(ref handle) = self.duckdb_handle {
+            handle.execute_async(sql);
+        }
+    }
+
+    pub fn record_notification_emissions(&mut self, emissions: Vec<NotificationEmission>) {
+        if emissions.is_empty() {
+            return;
+        }
+        let mut sql = String::from("BEGIN TRANSACTION;\n");
+        for em in &emissions {
+            sql.push_str(&upsert_notification_emission_sql(em));
+        }
+        sql.push_str(&format!(
+            "DELETE FROM notification_emissions WHERE id NOT IN (\
+                 SELECT id FROM notification_emissions ORDER BY created_at DESC LIMIT {}\
+             );\n\
+             COMMIT;\n",
+            DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS
+        ));
+        self.notification_emissions.splice(0..0, emissions);
+        if self.notification_emissions.len() > DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS {
+            self.notification_emissions
+                .truncate(DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS);
+        }
+        if let Some(ref handle) = self.duckdb_handle {
+            handle.execute_async(sql);
+        }
+    }
 }
 
 fn upsert_project_sql(proj: &SentryProject) -> String {
@@ -810,6 +934,36 @@ fn upsert_sync_meta_sql(meta: &SyncMeta) -> String {
     let payload = serde_json::to_string(meta).unwrap_or_default();
     format!(
         "INSERT OR REPLACE INTO sync_meta (id, payload) VALUES (1, '{}');\n",
+        sql_escape(&payload)
+    )
+}
+
+fn upsert_user_interaction_sql(interaction: &UserInteraction) -> String {
+    let payload = serde_json::to_string(interaction).unwrap_or_default();
+    format!(
+        "INSERT OR REPLACE INTO user_interactions (id, issue_id, short_id, project_slug, kind, weight, created_at, payload) VALUES ({}, '{}', '{}', '{}', '{}', {:.4}, '{}', '{}');\n",
+        interaction.id,
+        sql_escape(interaction.issue_id.as_str()),
+        sql_escape(interaction.short_id.as_str()),
+        sql_escape(interaction.project_slug.as_str()),
+        interaction.kind.label(),
+        interaction.weight,
+        sql_escape(&interaction.created_at.to_rfc3339()),
+        sql_escape(&payload)
+    )
+}
+
+fn upsert_notification_emission_sql(em: &NotificationEmission) -> String {
+    let payload = serde_json::to_string(em).unwrap_or_default();
+    format!(
+        "INSERT OR REPLACE INTO notification_emissions (id, issue_id, short_id, project_slug, urgency, score, created_at, payload) VALUES ({}, '{}', '{}', '{}', '{}', {:.4}, '{}', '{}');\n",
+        em.id,
+        sql_escape(em.issue_id.as_str()),
+        sql_escape(em.short_id.as_str()),
+        sql_escape(em.project_slug.as_str()),
+        sql_escape(em.urgency.as_str()),
+        em.score,
+        sql_escape(&em.created_at.to_rfc3339()),
         sql_escape(&payload)
     )
 }

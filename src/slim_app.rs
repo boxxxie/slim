@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use crate::{
     client::poller::SentryPollerHandle,
     config::{SlimConfig, save_config},
-    domain::SentryMutation,
+    domain::{IssueStatus, SentryMutation, UserInteractionKind},
     effect_registry::EffectRegistry,
     event::SlimEvent,
     id::ProjectScope,
@@ -129,6 +129,8 @@ impl SlimApp {
                     self.config = config.clone();
                     self.effects.effects_config = config.effects.clone();
                     self.widgets.list_state.show_sparklines = config.views.show_sparklines;
+                    self.widgets.notification_filter_mode =
+                        config.notifications.effective_filter_mode();
                     let _ = self.config_tx.send(config);
                     self.notice_service.push_notice(
                         NoticeLevel::Info,
@@ -175,6 +177,27 @@ impl SlimApp {
             SlimEvent::CycleIssueSort => {
                 self.widgets.filter_scope.sort = self.widgets.filter_scope.sort.next();
                 self.widgets.rebuild_derived(&self.store);
+            }
+            SlimEvent::CycleNotificationFilterMode => {
+                let next_mode = self.widgets.notification_filter_mode.cycle();
+                self.widgets.notification_filter_mode = next_mode;
+                self.config
+                    .notifications
+                    .set_effective_filter_mode(next_mode);
+                let _ = self.config_tx.send(self.config.clone());
+                let _ = save_config(&self.config_path, &self.config, false);
+                self.notice_service.push_notice(
+                    NoticeLevel::Info,
+                    NoticeMessage::GeneralMessage(
+                        format!(
+                            "Notification filter: {} ({} emitted, {} muted)",
+                            next_mode.label(),
+                            self.notification_buffer.total_emitted,
+                            self.notification_buffer.total_suppressed
+                        )
+                        .into(),
+                    ),
+                );
             }
             SlimEvent::FilterInputStart => {
                 self.widgets.filtering = true;
@@ -264,6 +287,8 @@ impl SlimApp {
                 }
             }
             SlimEvent::OpenIssueDetail(issue_id) => {
+                self.store
+                    .record_interaction(&issue_id, UserInteractionKind::InspectIssueDetail);
                 let needs_fetch = match (
                     self.store.issues.get(&issue_id),
                     self.store.events_by_issue.get(&issue_id),
@@ -329,6 +354,15 @@ impl SlimApp {
             }
             SlimEvent::MutateSelectedStatus(status) => {
                 if let Some(issue_id) = self.widgets.current_target_issue_id() {
+                    if matches!(status, IssueStatus::Resolved | IssueStatus::Ignored) {
+                        self.notification_buffer.drop_issue(&issue_id);
+                    }
+                    let interaction_kind = match status {
+                        IssueStatus::Resolved => UserInteractionKind::ResolveIssue,
+                        IssueStatus::Ignored => UserInteractionKind::IgnoreIssue,
+                        IssueStatus::Unresolved => UserInteractionKind::UnresolveIssue,
+                    };
+                    self.store.record_interaction(&issue_id, interaction_kind);
                     if let Some(issue) = self.store.issues.get(&issue_id) {
                         out.push(SlimEvent::SubmitMutation(SentryMutation::UpdateStatus {
                             issue_id,
@@ -366,6 +400,8 @@ impl SlimApp {
             }
             SlimEvent::CopySelectedShortId => {
                 if let Some(issue_id) = self.widgets.current_target_issue_id() {
+                    self.store
+                        .record_interaction(&issue_id, UserInteractionKind::CopyIssueId);
                     if let Some(issue) = self.store.issues.get(&issue_id) {
                         out.push(SlimEvent::CopyToClipboard {
                             label: CompactString::from("Short ID"),
@@ -376,6 +412,8 @@ impl SlimApp {
             }
             SlimEvent::CopySelectedMarkdownSummary => {
                 if let Some(issue_id) = self.widgets.current_target_issue_id() {
+                    self.store
+                        .record_interaction(&issue_id, UserInteractionKind::CopyIssueSummary);
                     if let Some(issue) = self.store.issues.get(&issue_id) {
                         let md = if let Some(ev) = self.store.events_by_issue.get(&issue_id) {
                             ev.format_markdown_summary(issue)
@@ -421,6 +459,16 @@ impl SlimApp {
                 }
             }
             SlimEvent::OpenUrl(url) => {
+                if let Some(issue_id) = self
+                    .store
+                    .issues
+                    .values()
+                    .find(|i| i.permalink == url)
+                    .map(|i| i.id.clone())
+                {
+                    self.store
+                        .record_interaction(&issue_id, UserInteractionKind::OpenIssueWeb);
+                }
                 let _ = open::that(url.as_str());
                 self.notice_service.push_notice(
                     NoticeLevel::Info,
@@ -436,8 +484,13 @@ impl SlimApp {
                 } else {
                     self.poller.sync_now();
                     if let Some(ref mut detail) = self.widgets.open_issue_detail {
+                        let detail_id = detail.issue_id.clone();
                         detail.loading_event = true;
-                        self.poller.fetch_issue_event(detail.issue_id.clone());
+                        self.poller.fetch_issue_event(detail_id.clone());
+                        self.store.record_interaction(
+                            &detail_id,
+                            UserInteractionKind::ManualRefreshIssue,
+                        );
                     }
                     self.notice_service.push_notice(
                         NoticeLevel::Info,
@@ -465,10 +518,18 @@ impl SlimApp {
                 }
             }
             SlimEvent::FlushNotificationBuffer => {
-                let alerts = self
-                    .notification_buffer
-                    .evaluate_and_flush(&self.config.notifications, !self.offline);
-                for alert in alerts {
+                let eval = self.notification_buffer.evaluate_and_flush(
+                    &self.config.notifications,
+                    &self.store.notification_emissions,
+                    &self.store.user_interactions,
+                    self.widgets.notification_filter_mode,
+                    !self.offline,
+                );
+                self.store
+                    .record_notification_emissions(eval.recorded_emissions);
+                self.widgets.notifications_emitted = self.notification_buffer.total_emitted;
+                self.widgets.notifications_suppressed = self.notification_buffer.total_suppressed;
+                for alert in eval.emitted {
                     self.notice_service.push_notice(
                         NoticeLevel::Info,
                         NoticeMessage::GeneralMessage(

@@ -6,7 +6,8 @@ use ratatui::layout::Rect;
 use crate::{
     config::SlimConfig,
     domain::{
-        ActivityEvent, IssueLevel, IssueSort, IssueStatus, ListViewKind, SentryIssue,
+        ActivityEvent, IssueLevel, IssueSort, IssueStatus, ListViewKind, NotificationFilterMode,
+        SentryIssue,
     },
     event::SlimEvent,
     id::{IssueId, ProjectScope},
@@ -44,6 +45,9 @@ pub struct StatefulWidgets {
     pub open_issue_detail: Option<IssueDetailState>,
     pub modal: Option<ModalState>,
     pub active_notice: Option<Notice>,
+    pub notification_filter_mode: NotificationFilterMode,
+    pub notifications_emitted: u64,
+    pub notifications_suppressed: u64,
     pub last_synced_generation: u64,
     pub hitboxes: Vec<(Rect, SlimEvent)>,
 }
@@ -52,6 +56,7 @@ impl StatefulWidgets {
     pub fn new(config: &SlimConfig) -> Self {
         let mut list_state = IssuesListState::default();
         list_state.show_sparklines = config.views.show_sparklines;
+        let notification_filter_mode = config.notifications.effective_filter_mode();
         Self {
             active_list_view: config.views.default_view,
             filter_scope: FilterScope::default(),
@@ -61,6 +66,9 @@ impl StatefulWidgets {
             open_issue_detail: None,
             modal: None,
             active_notice: None,
+            notification_filter_mode,
+            notifications_emitted: 0,
+            notifications_suppressed: 0,
             last_synced_generation: 0,
             hitboxes: Vec::with_capacity(64),
         }
@@ -232,6 +240,7 @@ impl StatefulWidgets {
                 Shortcut::new("Enter/Click", "Inspect Issue"),
                 Shortcut::new("p", "Project"),
                 Shortcut::new("s", "Sort"),
+                Shortcut::new("m", "Notif Mode"),
                 Shortcut::new("/", "Filter"),
                 Shortcut::new("R/I/U", "Resolve/Ignore/Unres"),
                 Shortcut::new("y/Y", "Copy ID/Markdown"),
