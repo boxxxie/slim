@@ -3,14 +3,14 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Sender},
+    sync::mpsc::{self, Sender, SyncSender},
     thread,
+    time::Duration,
 };
 
 use chrono::Utc;
 use compact_str::CompactString;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::{
@@ -29,6 +29,7 @@ const DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS: usize = 300;
 const DEFAULT_HYDRATE_MAX_PROJECTS: usize = 200;
 const DEFAULT_HYDRATE_MAX_INTERACTIONS: usize = 500;
 const DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS: usize = 500;
+const MAX_CACHED_EVENTS_IN_RAM: usize = 8;
 
 const DUCKDB_LOW_MEMORY_SQL: &str = "\
 SET threads=1;
@@ -68,6 +69,7 @@ CREATE TABLE IF NOT EXISTS issues (
     permalink VARCHAR,
     payload VARCHAR
 );
+CREATE INDEX IF NOT EXISTS idx_issues_last_seen ON issues (last_seen);
 CREATE TABLE IF NOT EXISTS issue_events (
     issue_id VARCHAR PRIMARY KEY,
     event_id VARCHAR,
@@ -87,6 +89,7 @@ CREATE TABLE IF NOT EXISTS activity_events (
     timestamp VARCHAR,
     payload VARCHAR
 );
+CREATE INDEX IF NOT EXISTS idx_activity_events_timestamp ON activity_events (timestamp);
 CREATE TABLE IF NOT EXISTS sync_meta (
     id INTEGER PRIMARY KEY,
     payload VARCHAR
@@ -137,7 +140,11 @@ fn sql_opt_str(opt: Option<&str>) -> String {
 #[derive(Debug)]
 enum SqlWorkerMsg {
     Execute(String),
-    Shutdown(mpsc::SyncSender<()>),
+    QueryRows {
+        sql: String,
+        reply: SyncSender<Vec<String>>,
+    },
+    Shutdown(SyncSender<()>),
 }
 
 #[derive(Debug)]
@@ -154,6 +161,30 @@ impl DuckDbHandle {
         }
     }
 
+    pub fn query_payloads<T: DeserializeOwned>(&self, inner_sql: &str) -> Vec<T> {
+        let wrapped = format!(
+            "SELECT replace(replace(payload, chr(10), ' '), chr(13), ' ') FROM ({});",
+            inner_sql.trim().trim_end_matches(';')
+        );
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if self
+            .sql_tx
+            .send(SqlWorkerMsg::QueryRows {
+                sql: wrapped,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        let Ok(rows) = reply_rx.recv_timeout(Duration::from_secs(3)) else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .filter_map(|s| serde_json::from_str::<T>(&s).ok())
+            .collect()
+    }
+
     pub fn shutdown(&self) {
         if let Some(ref uri) = self.quack_listen_uri {
             let _ = self.sql_tx.send(SqlWorkerMsg::Execute(format!(
@@ -163,7 +194,7 @@ impl DuckDbHandle {
         }
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         if self.sql_tx.send(SqlWorkerMsg::Shutdown(ack_tx)).is_ok() {
-            let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
+            let _ = ack_rx.recv_timeout(Duration::from_secs(5));
         }
     }
 }
@@ -215,90 +246,58 @@ impl SentryStore {
         }
 
         let duckdb_bin = resolve_duckdb_binary();
-
-        if self.db_path.exists() {
-            self.load_existing_rows(&duckdb_bin);
-        } else {
-            let init_sql = format!("{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}");
-            let _ = Command::new(&duckdb_bin)
-                .env("MALLOC_ARENA_MAX", "1")
-                .arg("-dark-mode")
-                .arg("-batch")
-                .arg(&self.db_path)
-                .arg("-c")
-                .arg(init_sql)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-
         self.start_persistent_worker(&duckdb_bin, db_config, event_sender);
+        self.load_existing_rows();
     }
 
-    fn load_existing_rows(&mut self, duckdb_bin: &Path) {
-        let init_sql = format!("CHECKPOINT;\n{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}");
-        let _ = Command::new(duckdb_bin)
-            .env("MALLOC_ARENA_MAX", "1")
-            .arg("-dark-mode")
-            .arg("-batch")
-            .arg(&self.db_path)
-            .arg("-c")
-            .arg(init_sql)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    fn load_existing_rows(&mut self) {
+        let Some(ref handle) = self.duckdb_handle else {
+            return;
+        };
 
         let projects_sql = format!(
-            "SELECT payload FROM (SELECT payload FROM projects ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_PROJECTS});"
+            "SELECT payload FROM projects ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_PROJECTS}"
         );
-        for proj in query_payloads::<SentryProject>(duckdb_bin, &self.db_path, &projects_sql) {
-            self.projects.insert(proj.id.clone(), proj);
-        }
+        let loaded_projects: Vec<SentryProject> = handle.query_payloads(&projects_sql);
 
         let issues_tail_scan = DEFAULT_HYDRATE_MAX_ISSUES.saturating_mul(4);
         let issues_sql = format!(
-            "SELECT payload FROM (SELECT payload, last_seen FROM issues ORDER BY rowid DESC LIMIT {issues_tail_scan}) ORDER BY last_seen DESC LIMIT {DEFAULT_HYDRATE_MAX_ISSUES};"
+            "SELECT payload FROM (SELECT payload, last_seen FROM issues ORDER BY rowid DESC LIMIT {issues_tail_scan}) ORDER BY last_seen DESC LIMIT {DEFAULT_HYDRATE_MAX_ISSUES}"
         );
-        for issue in query_payloads::<SentryIssue>(duckdb_bin, &self.db_path, &issues_sql) {
-            self.issues.insert(issue.id.clone(), issue);
-        }
-
-        let events_sql = format!(
-            "SELECT payload FROM (SELECT payload FROM issue_events ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_ISSUES});"
-        );
-        for ev_detail in query_payloads::<SentryEventDetail>(duckdb_bin, &self.db_path, &events_sql)
-        {
-            self.events_by_issue
-                .insert(ev_detail.issue_id.clone(), ev_detail);
-        }
+        let loaded_issues: Vec<SentryIssue> = handle.query_payloads(&issues_sql);
 
         let activity_sql = format!(
-            "SELECT payload FROM (SELECT payload, timestamp FROM activity_events ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS}) ORDER BY timestamp DESC LIMIT {DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS};"
+            "SELECT payload FROM (SELECT payload, timestamp FROM activity_events ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS}) ORDER BY timestamp DESC LIMIT {DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS}"
         );
-        for act in query_payloads::<ActivityEvent>(duckdb_bin, &self.db_path, &activity_sql) {
-            self.activity_events.push_back(act);
-        }
+        let loaded_activity: Vec<ActivityEvent> = handle.query_payloads(&activity_sql);
 
         let interactions_sql = format!(
-            "SELECT payload FROM (SELECT payload, created_at FROM user_interactions ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_INTERACTIONS}) ORDER BY created_at DESC LIMIT {DEFAULT_HYDRATE_MAX_INTERACTIONS};"
+            "SELECT payload FROM (SELECT payload, created_at FROM user_interactions ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_INTERACTIONS}) ORDER BY created_at DESC LIMIT {DEFAULT_HYDRATE_MAX_INTERACTIONS}"
         );
-        self.user_interactions =
-            query_payloads::<UserInteraction>(duckdb_bin, &self.db_path, &interactions_sql);
+        let loaded_interactions: Vec<UserInteraction> = handle.query_payloads(&interactions_sql);
 
         let emissions_sql = format!(
-            "SELECT payload FROM (SELECT payload, created_at FROM notification_emissions ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS}) ORDER BY created_at DESC LIMIT {DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS};"
+            "SELECT payload FROM (SELECT payload, created_at FROM notification_emissions ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS}) ORDER BY created_at DESC LIMIT {DEFAULT_HYDRATE_MAX_NOTIFICATION_EMISSIONS}"
         );
-        self.notification_emissions =
-            query_payloads::<NotificationEmission>(duckdb_bin, &self.db_path, &emissions_sql);
+        let loaded_emissions: Vec<NotificationEmission> = handle.query_payloads(&emissions_sql);
 
-        if let Some(meta) = query_payloads::<SyncMeta>(
-            duckdb_bin,
-            &self.db_path,
-            "SELECT payload FROM sync_meta WHERE id = 1 LIMIT 1;",
-        )
-        .into_iter()
-        .next()
-        {
+        let loaded_meta: Option<SyncMeta> = handle
+            .query_payloads("SELECT payload FROM sync_meta WHERE id = 1 LIMIT 1")
+            .into_iter()
+            .next();
+
+        for proj in loaded_projects {
+            self.projects.insert(proj.id.clone(), proj);
+        }
+        for issue in loaded_issues {
+            self.issues.insert(issue.id.clone(), issue);
+        }
+        for act in loaded_activity {
+            self.activity_events.push_back(act);
+        }
+        self.user_interactions = loaded_interactions;
+        self.notification_emissions = loaded_emissions;
+        if let Some(meta) = loaded_meta {
             self.sync_meta = meta;
         }
 
@@ -310,10 +309,32 @@ impl SentryStore {
         info!(
             projects = self.projects.len(),
             issues = self.issues.len(),
-            cached_events = self.events_by_issue.len(),
             activity_events = self.activity_events.len(),
-            "Loaded cached Sentry state from DuckDB 2.0"
+            "Loaded cached Sentry state from DuckDB 2.0 (8MB limit, lazy issue_events)"
         );
+    }
+
+    /// Queries the persistent DuckDB worker on demand for a single issue's `SentryEventDetail`
+    /// if it is not already in the small in-memory cache.
+    pub fn ensure_issue_event_loaded(&mut self, issue_id: &IssueId) -> Option<&SentryEventDetail> {
+        if !self.events_by_issue.contains_key(issue_id) {
+            let loaded = self.duckdb_handle.as_ref().and_then(|handle| {
+                let sql = format!(
+                    "SELECT payload FROM issue_events WHERE issue_id = '{}' LIMIT 1",
+                    sql_escape(issue_id.as_str())
+                );
+                handle.query_payloads::<SentryEventDetail>(&sql).into_iter().next()
+            });
+            if let Some(detail) = loaded {
+                if self.events_by_issue.len() >= MAX_CACHED_EVENTS_IN_RAM {
+                    if let Some(evict_id) = self.events_by_issue.keys().next().cloned() {
+                        self.events_by_issue.remove(&evict_id);
+                    }
+                }
+                self.events_by_issue.insert(issue_id.clone(), detail);
+            }
+        }
+        self.events_by_issue.get(issue_id)
     }
 
     fn start_persistent_worker(
@@ -326,10 +347,12 @@ impl SentryStore {
             .env("MALLOC_ARENA_MAX", "1")
             .arg("-dark-mode")
             .arg("-batch")
+            .arg("-list")
+            .arg("-noheader")
             .arg(&self.db_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
         {
             Ok(c) => c,
@@ -343,13 +366,17 @@ impl SentryStore {
             Some(s) => s,
             None => return,
         };
-        let stdout = child.stdout.take();
+        let Some(stdout) = child.stdout.take() else {
+            return;
+        };
 
         let _ = writeln!(
             stdin,
-            "CHECKPOINT;\n{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}"
+            "{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}\nDELETE FROM activity_events WHERE id NOT IN (SELECT id FROM activity_events ORDER BY timestamp DESC LIMIT 1000);\nCHECKPOINT;"
         );
+        let _ = stdin.flush();
 
+        let mut reader = BufReader::new(stdout);
         let mut quack_listen_uri = None;
         let mut quack_token = None;
 
@@ -362,62 +389,40 @@ impl SentryStore {
                 sql_escape(&token)
             );
             if writeln!(stdin, "{init_quack_sql}").is_ok() && stdin.flush().is_ok() {
-                if let Some(out) = stdout {
-                    let mut reader = BufReader::new(out);
-                    let mut line = String::new();
-                    let mut started_ok = false;
-                    while let Ok(n) = reader.read_line(&mut line) {
-                        if n == 0 {
-                            break;
-                        }
-                        if line.contains(&uri) {
-                            started_ok = true;
-                        }
-                        if line.contains("SLIM_QUACK_DONE") {
-                            break;
-                        }
-                        line.clear();
-                    }
-                    thread::spawn(move || {
-                        let mut sink = String::new();
-                        while let Ok(n) = reader.read_line(&mut sink) {
-                            if n == 0 {
-                                break;
-                            }
-                            sink.clear();
-                        }
-                    });
-
-                    if started_ok {
-                        info!(uri = %uri, "Started DuckDB 2.0 Quack protocol server");
-                        quack_listen_uri = Some(uri.into());
-                        quack_token = Some(token);
-                    } else if let Some(tx) = event_sender {
-                        let _ = tx.send(SlimEvent::ActivityNotice(
-                            format!(
-                                "Quack port {} in use; running DuckDB in local-only mode",
-                                db_config.quack_port
-                            )
-                            .into(),
-                        ));
-                    }
-                }
-            }
-        } else if let Some(out) = stdout {
-            thread::spawn(move || {
-                let mut reader = BufReader::new(out);
-                let mut sink = String::new();
-                while let Ok(n) = reader.read_line(&mut sink) {
+                let mut line = String::new();
+                let mut started_ok = false;
+                while let Ok(n) = reader.read_line(&mut line) {
                     if n == 0 {
                         break;
                     }
-                    sink.clear();
+                    if line.contains(&uri) {
+                        started_ok = true;
+                    }
+                    if line.contains("SLIM_QUACK_DONE") {
+                        break;
+                    }
+                    line.clear();
                 }
-            });
+
+                if started_ok {
+                    info!(uri = %uri, "Started DuckDB 2.0 Quack protocol server");
+                    quack_listen_uri = Some(uri.into());
+                    quack_token = Some(token);
+                } else if let Some(tx) = event_sender {
+                    let _ = tx.send(SlimEvent::ActivityNotice(
+                        format!(
+                            "Quack port {} in use; running DuckDB in local-only mode",
+                            db_config.quack_port
+                        )
+                        .into(),
+                    ));
+                }
+            }
         }
 
         let (sql_tx, sql_rx) = mpsc::channel::<SqlWorkerMsg>();
         thread::spawn(move || {
+            let mut line_buf = String::new();
             let mut ack_on_exit = None;
             while let Ok(msg) = sql_rx.recv() {
                 match msg {
@@ -426,6 +431,31 @@ impl SentryStore {
                             break;
                         }
                         let _ = stdin.flush();
+                    }
+                    SqlWorkerMsg::QueryRows { sql, reply } => {
+                        let sentinel = "__SLIM_QUERY_END__";
+                        if writeln!(stdin, "{sql}\nSELECT '{sentinel}';").is_err()
+                            || stdin.flush().is_err()
+                        {
+                            let _ = reply.send(Vec::new());
+                            break;
+                        }
+                        let mut rows = Vec::new();
+                        line_buf.clear();
+                        while let Ok(n) = reader.read_line(&mut line_buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            let trimmed = line_buf.trim();
+                            if trimmed == sentinel {
+                                break;
+                            }
+                            if trimmed.starts_with('{') {
+                                rows.push(trimmed.to_string());
+                            }
+                            line_buf.clear();
+                        }
+                        let _ = reply.send(rows);
                     }
                     SqlWorkerMsg::Shutdown(ack) => {
                         let _ = writeln!(stdin, "CHECKPOINT;");
@@ -710,14 +740,24 @@ impl SentryStore {
             }
         }
 
+        let has_new_activities = !new_activities.is_empty();
         new_activities.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         for act in new_activities {
             sql.push_str(&upsert_activity_sql(&act));
             self.activity_events.push_front(act);
         }
 
-        while self.activity_events.len() > max_activity_events.max(50) {
+        let max_act = max_activity_events.max(50);
+        while self.activity_events.len() > max_act {
             self.activity_events.pop_back();
+        }
+        if has_new_activities {
+            sql.push_str(&format!(
+                "DELETE FROM activity_events WHERE id NOT IN (\
+                     SELECT id FROM activity_events ORDER BY timestamp DESC LIMIT {}\
+                 );\n",
+                max_act.max(DEFAULT_HYDRATE_MAX_ACTIVITY_EVENTS)
+            ));
         }
 
         if self.issues.len() > max_stored_issues.max(100) {
@@ -729,6 +769,7 @@ impl SentryStore {
             all_ids.sort_by(|a, b| b.1.cmp(&a.1));
             for (drop_id, _) in all_ids.into_iter().skip(max_stored_issues.max(100)) {
                 self.issues.remove(&drop_id);
+                self.events_by_issue.remove(&drop_id);
             }
         }
 
@@ -747,6 +788,13 @@ impl SentryStore {
 
     pub fn apply_issue_event(&mut self, detail: SentryEventDetail) {
         let sql = format!("BEGIN TRANSACTION;\n{}COMMIT;\n", upsert_event_sql(&detail));
+        if !self.events_by_issue.contains_key(&detail.issue_id)
+            && self.events_by_issue.len() >= MAX_CACHED_EVENTS_IN_RAM
+        {
+            if let Some(evict_id) = self.events_by_issue.keys().next().cloned() {
+                self.events_by_issue.remove(&evict_id);
+            }
+        }
         self.events_by_issue.insert(detail.issue_id.clone(), detail);
         if let Some(ref handle) = self.duckdb_handle {
             handle.execute_async(sql);
@@ -966,42 +1014,6 @@ fn upsert_notification_emission_sql(em: &NotificationEmission) -> String {
         sql_escape(&em.created_at.to_rfc3339()),
         sql_escape(&payload)
     )
-}
-
-fn query_payloads<T: DeserializeOwned>(duckdb_bin: &Path, db_path: &Path, sql: &str) -> Vec<T> {
-    let full_sql = format!("{DUCKDB_LOW_MEMORY_SQL}\n{sql}");
-    let Ok(out) = Command::new(duckdb_bin)
-        .env("MALLOC_ARENA_MAX", "1")
-        .arg("-dark-mode")
-        .arg("-readonly")
-        .arg("-json")
-        .arg(db_path)
-        .arg("-c")
-        .arg(full_sql)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return Vec::new();
-    };
-
-    if !out.status.success() {
-        return Vec::new();
-    }
-
-    let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&out.stdout) else {
-        return Vec::new();
-    };
-
-    let mut parsed = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(payload_str) = row.get("payload").and_then(|v| v.as_str()) {
-            if let Ok(entity) = serde_json::from_str::<T>(payload_str) {
-                parsed.push(entity);
-            }
-        }
-    }
-    parsed
 }
 
 pub fn load_or_create_quack_token() -> CompactString {

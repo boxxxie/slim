@@ -16,6 +16,7 @@ use crate::{
     domain::{IssueStatus, SentryMutation, UserInteractionKind},
     effect_registry::EffectRegistry,
     event::SlimEvent,
+    hot_reload::HotReloadState,
     id::ProjectScope,
     input::{process_key_event, process_mouse_event},
     notice_service::{NoticeLevel, NoticeMessage, NoticeService},
@@ -51,13 +52,40 @@ impl SlimApp {
         config_path: PathBuf,
         config: SlimConfig,
         config_tx: watch::Sender<SlimConfig>,
-        store: SentryStore,
+        mut store: SentryStore,
         poller: SentryPollerHandle,
         event_sender: Sender<SlimEvent>,
         offline: bool,
     ) -> Self {
         let mut widgets = StatefulWidgets::new(&config);
-        widgets.rebuild_derived(&store);
+        let mut notice_service = NoticeService::new();
+        if let Some(reload) = HotReloadState::load_from_env() {
+            widgets.active_list_view = reload.active_list_view;
+            widgets.filter_scope.project_scope = reload.project_scope;
+            widgets.filter_scope.sort = reload.sort;
+            widgets.filter_scope.search_query = reload.search_query;
+            widgets.rebuild_derived(&store);
+            if let Some(row) = reload.selected_row {
+                let len = widgets.list_state.len(widgets.active_list_view);
+                if len > 0 {
+                    widgets.list_state.table_state.select(Some(row.min(len - 1)));
+                }
+            }
+            if let Some(detail_id) = reload.open_detail_issue_id {
+                let has_event = store.ensure_issue_event_loaded(&detail_id).is_some();
+                let mut detail_state = IssueDetailState::new(detail_id, !has_event);
+                if let Some(page) = reload.open_detail_page {
+                    detail_state.active_page = page;
+                }
+                widgets.open_issue_detail = Some(detail_state);
+            }
+            notice_service.push_notice(
+                NoticeLevel::Info,
+                NoticeMessage::GeneralMessage("Hot-reloaded slim binary in-place".into()),
+            );
+        } else {
+            widgets.rebuild_derived(&store);
+        }
         let effects = EffectRegistry::new(event_sender.clone(), config.effects.clone());
 
         Self {
@@ -70,11 +98,31 @@ impl SlimApp {
             widgets,
             poller,
             notification_buffer: NotificationBuffer::new(),
-            notice_service: NoticeService::new(),
+            notice_service,
             effects,
             event_sender,
             terminal_area: Rect::new(0, 0, 120, 40),
             last_frame_instant: Instant::now(),
+        }
+    }
+
+    pub fn snapshot_hot_reload_state(&self) -> HotReloadState {
+        HotReloadState {
+            active_list_view: self.widgets.active_list_view,
+            project_scope: self.widgets.filter_scope.project_scope.clone(),
+            sort: self.widgets.filter_scope.sort,
+            search_query: self.widgets.filter_scope.search_query.clone(),
+            selected_row: self.widgets.list_state.table_state.selected(),
+            open_detail_issue_id: self
+                .widgets
+                .open_issue_detail
+                .as_ref()
+                .map(|d| d.issue_id.clone()),
+            open_detail_page: self
+                .widgets
+                .open_issue_detail
+                .as_ref()
+                .map(|d| d.active_page),
         }
     }
 
@@ -289,6 +337,7 @@ impl SlimApp {
             SlimEvent::OpenIssueDetail(issue_id) => {
                 self.store
                     .record_interaction(&issue_id, UserInteractionKind::InspectIssueDetail);
+                let _ = self.store.ensure_issue_event_loaded(&issue_id);
                 let needs_fetch = match (
                     self.store.issues.get(&issue_id),
                     self.store.events_by_issue.get(&issue_id),
@@ -414,6 +463,7 @@ impl SlimApp {
                 if let Some(issue_id) = self.widgets.current_target_issue_id() {
                     self.store
                         .record_interaction(&issue_id, UserInteractionKind::CopyIssueSummary);
+                    let _ = self.store.ensure_issue_event_loaded(&issue_id);
                     if let Some(issue) = self.store.issues.get(&issue_id) {
                         let md = if let Some(ev) = self.store.events_by_issue.get(&issue_id) {
                             ev.format_markdown_summary(issue)

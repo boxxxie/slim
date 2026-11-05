@@ -8,6 +8,7 @@ pub mod domain;
 pub mod effect_registry;
 pub mod event;
 pub mod gruvbox;
+pub mod hot_reload;
 pub mod id;
 pub mod input;
 pub mod logging;
@@ -185,6 +186,9 @@ async fn async_main() -> Result<()> {
 
     let mut app = initialize_app(config_path, sender, args.offline)?;
     let mut ui_events = Vec::with_capacity(8);
+    let binary_watcher = hot_reload::BinaryWatcher::new();
+    let mut last_binary_check = std::time::Instant::now();
+    let mut pending_hot_reload: Option<PathBuf> = None;
 
     while app.is_running() {
         let elapsed = app.elapsed_fx_duration();
@@ -217,9 +221,30 @@ async fn async_main() -> Result<()> {
                 }
             }
         }
+
+        if last_binary_check.elapsed() >= Duration::from_millis(1500) {
+            last_binary_check = std::time::Instant::now();
+            if let Some(updated_exe) = binary_watcher.updated_binary_path() {
+                pending_hot_reload = Some(updated_exe);
+                app.store.shutdown();
+                app.running = false;
+            }
+        }
     }
 
+    let reload_target = if let Some(updated_exe) = pending_hot_reload {
+        let state_file = app.snapshot_hot_reload_state().save_to_disk()?;
+        Some((updated_exe, state_file))
+    } else {
+        None
+    };
+
     tui.exit()?;
+
+    if let Some((updated_exe, state_file)) = reload_target {
+        hot_reload::exec_new_binary(&updated_exe, &state_file)?;
+    }
+
     Ok(())
 }
 
@@ -297,6 +322,7 @@ async fn run_inspect_issue(config_path: PathBuf, target: &str, offline: bool) ->
         ));
     };
 
+    let _ = store.ensure_issue_event_loaded(&issue_id);
     if !offline && !store.events_by_issue.contains_key(&issue_id) {
         let (tx, rx) = mpsc::channel();
         let client_cfg = ClientConfig::from_slim_config(&cfg, false);
