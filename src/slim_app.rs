@@ -201,6 +201,9 @@ impl SlimApp {
             SlimEvent::SwitchListView(view) => {
                 self.widgets.open_issue_detail = None;
                 self.widgets.active_list_view = view;
+                if view == crate::domain::ListViewKind::IncomingFeed {
+                    self.widgets.acknowledge_activity(&self.store);
+                }
                 self.widgets.rebuild_derived(&self.store);
             }
             SlimEvent::CycleProjectScope { reverse } => {

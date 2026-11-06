@@ -2,7 +2,7 @@ use std::{io, panic};
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 use ratatui::{Terminal, backend::Backend};
 
@@ -26,6 +26,7 @@ impl<B: Backend> Tui<B> {
         terminal::enable_raw_mode().map_err(|e| SlimError::GeneralError(e.to_string().into()))?;
         crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
             .map_err(|e| SlimError::GeneralError(e.to_string().into()))?;
+        crate::os_notify::set_terminal_window_title("🐛 slim • Sentry");
 
         let panic_hook = panic::take_hook();
         panic::set_hook(Box::new(move |panic_info| {
@@ -51,8 +52,13 @@ impl<B: Backend> Tui<B> {
 
     fn reset() -> Result<()> {
         terminal::disable_raw_mode().map_err(|e| SlimError::GeneralError(e.to_string().into()))?;
-        crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)
-            .map_err(|e| SlimError::GeneralError(e.to_string().into()))?;
+        crossterm::execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            SetTitle("")
+        )
+        .map_err(|e| SlimError::GeneralError(e.to_string().into()))?;
         Ok(())
     }
 

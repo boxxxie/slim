@@ -1,5 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
+use chrono::{DateTime, Utc};
 use compact_str::CompactString;
 use ratatui::layout::Rect;
 
@@ -49,6 +50,8 @@ pub struct StatefulWidgets {
     pub notifications_emitted: u64,
     pub notifications_suppressed: u64,
     pub last_synced_generation: u64,
+    pub last_ack_activity_ts: Option<DateTime<Utc>>,
+    pub last_window_title: String,
     pub hitboxes: Vec<(Rect, SlimEvent)>,
 }
 
@@ -70,6 +73,8 @@ impl StatefulWidgets {
             notifications_emitted: 0,
             notifications_suppressed: 0,
             last_synced_generation: 0,
+            last_ack_activity_ts: None,
+            last_window_title: String::new(),
             hitboxes: Vec::with_capacity(64),
         }
     }
@@ -200,6 +205,11 @@ impl StatefulWidgets {
         self.list_state.rows = issues;
         self.list_state.feed_rows = feed_rows;
 
+        if self.last_ack_activity_ts.is_none() || self.active_list_view == ListViewKind::IncomingFeed
+        {
+            self.acknowledge_activity(store);
+        }
+
         if let Some(prev_id) = prev_selected_id {
             let pos = if self.active_list_view == ListViewKind::IncomingFeed {
                 self.list_state
@@ -219,6 +229,80 @@ impl StatefulWidgets {
         }
 
         self.last_synced_generation = store.generation;
+    }
+
+    pub fn acknowledge_activity(&mut self, store: &SentryStore) {
+        if let Some(latest_ts) = store.activity_events.iter().map(|e| e.timestamp).max() {
+            self.last_ack_activity_ts = Some(
+                self.last_ack_activity_ts
+                    .map_or(latest_ts, |prev| prev.max(latest_ts)),
+            );
+        } else if self.last_ack_activity_ts.is_none() {
+            self.last_ack_activity_ts = Some(Utc::now());
+        }
+    }
+
+    pub fn sync_window_title(&mut self, store: &SentryStore, org_slug: &str) {
+        if self.active_list_view == ListViewKind::IncomingFeed {
+            self.acknowledge_activity(store);
+        }
+
+        let mut unresolved_count = 0usize;
+        let mut high_unhandled_count = 0usize;
+
+        for iss in store.issues.values() {
+            if let ProjectScope::Project(ref slug) = self.filter_scope.project_scope {
+                if !iss.project_slug.eq_ignore_ascii_case(slug.as_str()) {
+                    continue;
+                }
+            }
+            if iss.status != IssueStatus::Unresolved {
+                continue;
+            }
+            unresolved_count += 1;
+            let high_or_unhandled = iss.is_unhandled
+                || iss.level == IssueLevel::Fatal
+                || iss.priority == crate::domain::IssuePriority::High
+                || iss.substatus.as_deref() == Some("regressed")
+                || iss.substatus.as_deref() == Some("escalating");
+            if high_or_unhandled {
+                high_unhandled_count += 1;
+            }
+        }
+
+        let unseen_events = match self.last_ack_activity_ts {
+            Some(ack_ts) => self
+                .list_state
+                .feed_rows
+                .iter()
+                .filter(|ev| ev.timestamp > ack_ts)
+                .count(),
+            None => 0,
+        };
+
+        let context_label: Option<String> = if let Some(issue_id) = self.current_target_issue_id() {
+            store
+                .issues
+                .get(&issue_id)
+                .map(|i| i.short_id.to_string())
+        } else if let ProjectScope::Project(ref slug) = self.filter_scope.project_scope {
+            Some(slug.to_string())
+        } else if !org_slug.trim().is_empty() {
+            Some(org_slug.trim().to_string())
+        } else {
+            None
+        };
+
+        let next_title = crate::os_notify::compute_window_title(
+            unresolved_count,
+            high_unhandled_count,
+            unseen_events,
+            context_label.as_deref(),
+        );
+        if next_title != self.last_window_title {
+            crate::os_notify::set_terminal_window_title(&next_title);
+            self.last_window_title = next_title;
+        }
     }
 
     pub fn active_shortcuts(&self) -> Shortcuts {

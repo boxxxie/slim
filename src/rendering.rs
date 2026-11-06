@@ -105,6 +105,8 @@ pub fn render_main_ui(
             SlimEvent::NotificationDismiss,
         );
     }
+
+    widgets.sync_window_title(store, org_slug);
 }
 
 fn push_clickable_span<'a>(
