@@ -13,6 +13,7 @@ use crate::{
 pub struct SentryService {
     api: SentryApiClient,
     has_completed_initial: bool,
+    has_fetched_projects: bool,
 }
 
 impl SentryService {
@@ -21,11 +22,30 @@ impl SentryService {
         Ok(Self {
             api,
             has_completed_initial: false,
+            has_fetched_projects: false,
         })
     }
 
+    pub fn needs_resync_on_config_change(&self, next: &ClientConfig) -> bool {
+        self.api.config().org != next.org
+            || self.api.config().base_url != next.base_url
+            || self.api.config().auth_token != next.auth_token
+            || self.api.config().configured_projects != next.configured_projects
+            || self.api.config().max_issues_per_poll != next.max_issues_per_poll
+    }
+
     pub fn update_config(&mut self, config: ClientConfig) {
+        let org_changed =
+            self.api.config().org != config.org || self.api.config().base_url != config.base_url;
         self.api.update_config(config);
+        if org_changed {
+            self.has_fetched_projects = false;
+        }
+    }
+
+    pub fn invalidate_for_manual_refresh(&mut self) {
+        self.has_fetched_projects = false;
+        self.api.clear_etag_cache();
     }
 
     pub async fn sync(&mut self, sender: &Sender<SlimEvent>) -> Result<(), ClientError> {
@@ -33,27 +53,44 @@ impl SentryService {
             return Err(ClientError::OfflineMode);
         }
 
-        let projects = self.api.fetch_projects().await.unwrap_or_default();
+        let projects = if !self.has_fetched_projects {
+            match self.api.fetch_projects_conditional().await {
+                Ok(Some(projs)) => {
+                    self.has_fetched_projects = true;
+                    projs
+                }
+                Ok(None) => {
+                    self.has_fetched_projects = true;
+                    Vec::new()
+                }
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
         // Fetch unresolved issues + recently active issues across configured projects
         let query = if self.api.config().configured_projects.is_empty() {
             None
+        } else if self.api.config().configured_projects.len() == 1 {
+            Some(format!("project:{}", self.api.config().configured_projects[0]))
         } else {
-            let proj_filters: Vec<String> = self
+            let joined = self
                 .api
                 .config()
                 .configured_projects
                 .iter()
-                .map(|p| format!("project:{p}"))
-                .collect();
-            if proj_filters.len() == 1 {
-                Some(proj_filters[0].clone())
-            } else {
-                None
-            }
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            Some(format!("project:[{joined}]"))
         };
 
-        let mut issues = self.api.fetch_issues(query.as_deref()).await?;
+        let Some(mut issues) = self.api.fetch_issues_conditional(query.as_deref()).await? else {
+            // 304 Not Modified: issue list has not changed since the last poll
+            self.has_completed_initial = true;
+            return Ok(());
+        };
 
         if !self.api.config().configured_projects.is_empty() {
             issues.retain(|iss| {
@@ -83,8 +120,9 @@ impl SentryService {
         issue_id: &IssueId,
         sender: &Sender<SlimEvent>,
     ) -> Result<(), ClientError> {
-        let detail = self.api.fetch_latest_event(issue_id).await?;
-        sender.dispatch(SlimEvent::IssueEventLoaded(Box::new(detail)));
+        if let Some(detail) = self.api.fetch_latest_event_conditional(issue_id).await? {
+            sender.dispatch(SlimEvent::IssueEventLoaded(Box::new(detail)));
+        }
         Ok(())
     }
 

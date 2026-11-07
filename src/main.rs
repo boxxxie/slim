@@ -277,7 +277,21 @@ async fn run_sync_once(config_path: PathBuf) -> Result<()> {
     }
 
     for issue_id in top_issue_ids {
-        if service.fetch_issue_event(&issue_id, &tx).await.is_ok() {
+        let _ = store.ensure_issue_event_loaded(&issue_id);
+        let needs_fetch = match (
+            store.issues.get(&issue_id),
+            store.events_by_issue.get(&issue_id),
+        ) {
+            (Some(iss), Some(ev)) => {
+                iss.last_seen
+                    .signed_duration_since(ev.date_created)
+                    .num_seconds()
+                    > 1
+            }
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if needs_fetch && service.fetch_issue_event(&issue_id, &tx).await.is_ok() {
             while let Ok(ev) = rx.try_recv() {
                 if let SlimEvent::IssueEventLoaded(detail) = ev {
                     store.apply_issue_event(*detail);

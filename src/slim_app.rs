@@ -345,7 +345,12 @@ impl SlimApp {
                     self.store.issues.get(&issue_id),
                     self.store.events_by_issue.get(&issue_id),
                 ) {
-                    (Some(iss), Some(ev)) => ev.date_created < iss.last_seen,
+                    (Some(iss), Some(ev)) => {
+                        iss.last_seen
+                            .signed_duration_since(ev.date_created)
+                            .num_seconds()
+                            > 1
+                    }
                     (Some(_), None) => true,
                     _ => false,
                 };

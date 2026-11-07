@@ -69,6 +69,10 @@ pub fn spawn_sentry_poller(
                     match cmd {
                         PollerCommand::SyncNow => {
                             if !offline {
+                                {
+                                    let mut svc = service.lock().await;
+                                    svc.invalidate_for_manual_refresh();
+                                }
                                 run_sync_guarded(&service, &sync_gate, &sender).await;
                             }
                         }
@@ -102,10 +106,13 @@ pub fn spawn_sentry_poller(
                     let next_cfg = config_rx.borrow_and_update().clone();
                     let next_poll = next_cfg.polling.poll_seconds.max(15);
 
-                    {
+                    let should_resync = {
                         let mut svc = service.lock().await;
-                        svc.update_config(ClientConfig::from_slim_config(&next_cfg, offline));
-                    }
+                        let next_client_cfg = ClientConfig::from_slim_config(&next_cfg, offline);
+                        let resync = svc.needs_resync_on_config_change(&next_client_cfg);
+                        svc.update_config(next_client_cfg);
+                        resync
+                    };
 
                     if next_poll != poll_secs {
                         poll_secs = next_poll;
@@ -114,7 +121,7 @@ pub fn spawn_sentry_poller(
                         poll_ticker.tick().await;
                     }
 
-                    if !offline {
+                    if should_resync && !offline {
                         run_sync_guarded(&service, &sync_gate, &sender).await;
                     }
                 }
